@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin">
+  <title>Twitch Multi-View — TV receiver</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; background: #000; color: #efeff1; overflow: hidden;
+      font: 14px/1.4 Inter, Roobert, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+
+    #grid { position: absolute; inset: 0; display: grid; gap: 4px; padding: 4px; }
+    #grid:empty { display: none; }
+
+    .tile { position: relative; background: #0a0a0c; border-radius: 4px; overflow: hidden; min-width: 0; min-height: 0; }
+    .tile iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
+    .tile .mount { position: absolute; inset: 0; }
+    .tile .label {
+      position: absolute; left: 8px; bottom: 8px; z-index: 2;
+      background: rgba(0,0,0,.62); color: #efeff1; padding: 3px 9px; border-radius: 12px;
+      font-size: 13px; font-weight: 600; letter-spacing: .2px; pointer-events: none;
+      transition: opacity .4s ease;
+    }
+    .tile .label.audio { background: rgba(0,179,126,.85); color: #fff; }
+    .labels-off .tile .label { display: none; }
+
+    #msg {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 14px; padding: 6vmin; text-align: center;
+    }
+    #msg.hidden { display: none; }
+    #msg h1 { margin: 0; font-size: clamp(20px, 3.4vw, 40px); color: #bf94ff; }
+    #msg p { margin: 0; max-width: 46em; color: #adadb8; font-size: clamp(13px, 1.5vw, 20px); }
+    #msg code {
+      background: #1f1f23; border: 1px solid #3a3a42; border-radius: 4px;
+      padding: 2px 7px; font-family: ui-monospace, Menlo, Consolas, monospace; color: #efeff1;
+    }
+    #msg .warn { color: #ffb545; }
+  </style>
+</head>
+<body>
+  <div id="grid"></div>
+  <div id="msg">
+    <h1>Twitch Multi-View — TV receiver</h1>
+    <p id="msg-body">Waiting for a line-up…</p>
+    <p>Add channels to the address: <code id="msg-url">?c=channel1,channel2</code></p>
+  </div>
+
+  <script>
+  /*
+   * Standalone receiver for the Twitch Multi-View userscript.
+   *
+   * It is deliberately dependency-free and self-contained so it can be dropped on any
+   * static HTTPS host (GitHub Pages, Netlify, an S3 bucket, …). It renders the same grid
+   * of official Twitch player embeds and takes its line-up from either
+   *
+   *   - the query string:  ?c=chan1,chan2&layout=2x2&audio=chan1&q=480p
+   *   - the Presentation API: live messages from the userscript's Cast button.
+   *
+   * `parent=` is derived from this page's own hostname, which is what makes the embeds
+   * legal here: it must match the host of the page doing the embedding, so the receiver
+   * only works from the domain you host it on (not from file://).
+   */
+  (function () {
+    'use strict';
+
+    var SDK_URL = 'https://player.twitch.tv/js/embed/v1.js';
+    var CHANNEL_RE = /^[a-zA-Z0-9_]{3,25}$/;
+
+    var gridEl = document.getElementById('grid');
+    var msgEl = document.getElementById('msg');
+    var msgBody = document.getElementById('msg-body');
+    var msgUrl = document.getElementById('msg-url');
+
+    var HOST = location.hostname;
+    var Player = null;              // Twitch Embed SDK constructor, null in iframe mode
+    var tiles = new Map();          // channel -> tile
+    var uid = 0;
+    var state = { channels: [], layout: 'auto', audio: null, quality: null, labels: true };
+
+    // -- helpers --------------------------------------------------------------
+
+    function normalize(name) {
+      var value = String(name || '').trim().toLowerCase();
+      return CHANNEL_RE.test(value) ? value : null;
+    }
+
+    function showMessage(text, warn) {
+      msgBody.textContent = text;
+      msgBody.className = warn ? 'warn' : '';
+      msgEl.classList.remove('hidden');
+    }
+
+    function hideMessage() {
+      msgEl.classList.add('hidden');
+    }
+
+    function loadSdk() {
+      return new Promise(function (resolve) {
+        if (window.Twitch && window.Twitch.Player) return resolve(window.Twitch.Player);
+        var done = function () {
+          resolve(window.Twitch && window.Twitch.Player ? window.Twitch.Player : null);
+        };
+        var script = document.createElement('script');
+        script.src = SDK_URL;
+        script.onload = done;
+        script.onerror = function () { resolve(null); };
+        document.head.appendChild(script);
+        setTimeout(done, 8000);   // CSP failures do not always fire onerror
+      });
+    }
+
+    // -- tiles ----------------------------------------------------------------
+
+    function frameUrl(channel, muted) {
+      return 'https://player.twitch.tv/?' + new URLSearchParams({
+        channel: channel,
+        parent: HOST,
+        muted: String(!!muted),
+        autoplay: 'true',
+        controls: 'false'
+      }).toString();
+    }
+
+    function pickQuality(list, target) {
+      var height = function (name) {
+        var match = String(name).match(/(\d+)p/);
+        return match ? Number(match[1]) : 0;
+      };
+      var wanted = height(target);
+      var ranked = list.filter(function (q) { return height(q) > 0; })
+        .sort(function (a, b) { return height(b) - height(a); });
+      if (!ranked.length) return null;
+      return ranked.find(function (q) { return height(q) <= wanted; }) || ranked[ranked.length - 1];
+    }
+
+    function makeTile(channel) {
+      var el = document.createElement('div');
+      el.className = 'tile';
+
+      var mount = document.createElement('div');
+      mount.className = 'mount';
+      mount.id = 'mount-' + (++uid);
+
+      var label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = channel;
+
+      el.appendChild(mount);
+      el.appendChild(label);
+
+      var tile = { channel: channel, el: el, mount: mount, label: label, player: null, iframe: null, muted: true };
+
+      if (Player) {
+        try {
+          tile.player = new Player(mount.id, {
+            channel: channel,
+            parent: [HOST],
+            width: '100%',
+            height: '100%',
+            muted: true,
+            autoplay: true,
+            controls: false
+          });
+          tile.player.addEventListener(Player.PLAYING, function () {
+            applyMuted(tile);
+            applyQuality(tile);
+          });
+        } catch (err) {
+          tile.player = null;
+        }
+      }
+
+      if (!tile.player) {
+        var frame = document.createElement('iframe');
+        frame.src = frameUrl(channel, true);
+        frame.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+        frame.setAttribute('allowfullscreen', '');
+        frame.frameBorder = '0';
+        frame.scrolling = 'no';
+        tile.iframe = frame;
+        mount.appendChild(frame);
+      }
+
+      return tile;
+    }
+
+    function destroyTile(tile) {
+      if (tile.player) {
+        try { tile.player.destroy(); } catch (ignored) { /* older SDK builds lack destroy() */ }
+      }
+      tile.el.remove();
+    }
+
+    function applyMuted(tile) {
+      var muted = state.audio !== tile.channel;
+      var changed = tile.muted !== muted;
+      tile.muted = muted;
+      tile.label.classList.toggle('audio', !muted);
+      if (!changed) return;
+      if (tile.player) {
+        try {
+          tile.player.setMuted(muted);
+          if (!muted && tile.player.getVolume() === 0) tile.player.setVolume(0.7);
+        } catch (ignored) { /* not ready yet; the PLAYING handler retries */ }
+      } else if (tile.iframe) {
+        // No JS bridge in fallback mode: mute state lives in the URL, so this reloads.
+        tile.iframe.src = frameUrl(tile.channel, muted);
+      }
+    }
+
+    function applyQuality(tile) {
+      if (!tile.player || !state.quality) return;
+      try {
+        var list = (tile.player.getQualities() || []).map(function (q) { return q.group || q.name; })
+          .filter(Boolean);
+        var want = pickQuality(list, state.quality);
+        if (want) tile.player.setQuality(want);
+      } catch (ignored) { /* quality list not loaded yet */ }
+    }
+
+    // -- layout ---------------------------------------------------------------
+
+    function applyGridTemplate(count) {
+      var cols;
+      var rows;
+      switch (state.layout) {
+        case 'rows': cols = '1fr'; rows = 'repeat(' + count + ', 1fr)'; break;
+        case 'cols': cols = 'repeat(' + count + ', 1fr)'; rows = '1fr'; break;
+        case '2x2': cols = 'repeat(2, 1fr)'; rows = 'repeat(' + Math.max(1, Math.ceil(count / 2)) + ', 1fr)'; break;
+        case '3x3': cols = 'repeat(3, 1fr)'; rows = 'repeat(' + Math.max(1, Math.ceil(count / 3)) + ', 1fr)'; break;
+        case 'focus': {
+          if (count === 1) { cols = '1fr'; rows = '1fr'; break; }
+          cols = 'minmax(0, 1fr) minmax(160px, 22%)';
+          rows = 'repeat(' + (count - 1) + ', minmax(0, 1fr))';
+          break;
+        }
+        default: {
+          var c = Math.ceil(Math.sqrt(count));
+          cols = 'repeat(' + c + ', minmax(0, 1fr))';
+          rows = 'repeat(' + Math.ceil(count / c) + ', minmax(0, 1fr))';
+        }
+      }
+      gridEl.style.gridTemplateColumns = cols;
+      gridEl.style.gridTemplateRows = rows;
+    }
+
+    function render() {
+      var wanted = state.channels.filter(Boolean);
+
+      // Only add and remove: an existing tile is never re-parented, because moving an
+      // iframe in the DOM reloads the player.
+      for (var entry of Array.from(tiles.entries())) {
+        if (wanted.indexOf(entry[0]) === -1) {
+          destroyTile(entry[1]);
+          tiles.delete(entry[0]);
+        }
+      }
+      wanted.forEach(function (channel, index) {
+        var tile = tiles.get(channel);
+        if (!tile) {
+          tile = makeTile(channel);
+          tiles.set(channel, tile);
+          gridEl.appendChild(tile.el);
+        }
+        tile.el.style.order = String(index);
+        tile.el.style.gridArea = '';
+      });
+
+      document.body.classList.toggle('labels-off', !state.labels);
+
+      if (!wanted.length) {
+        showMessage('Waiting for a line-up…');
+      } else {
+        hideMessage();
+        applyGridTemplate(wanted.length);
+        if (state.layout === 'focus' && wanted.length > 1) {
+          var main = tiles.get(wanted[0]);
+          if (main) main.el.style.gridArea = '1 / 1 / ' + wanted.length + ' / 2';
+        }
+      }
+
+      tiles.forEach(function (tile) {
+        applyMuted(tile);
+        applyQuality(tile);
+      });
+    }
+
+    function applyState(next) {
+      if (!next || typeof next !== 'object') return;
+      if (Array.isArray(next.channels)) {
+        state.channels = next.channels.map(normalize).filter(Boolean);
+      }
+      if (typeof next.layout === 'string') state.layout = next.layout;
+      if ('audio' in next) state.audio = normalize(next.audio);
+      if ('quality' in next) state.quality = next.quality || null;
+      if ('labels' in next) state.labels = !!next.labels;
+      render();
+    }
+
+    // -- inputs ---------------------------------------------------------------
+
+    function stateFromQuery() {
+      var params = new URLSearchParams(location.search);
+      var raw = params.get('c') || params.get('channels') || '';
+      return {
+        channels: raw.split(/[,+|\s]+/),
+        layout: params.get('layout') || 'auto',
+        audio: params.get('audio') || null,
+        quality: params.get('q') || null,
+        labels: params.get('labels') !== '0'
+      };
+    }
+
+    /**
+     * 2-UA Presentation API: the userscript calls PresentationRequest.start() with this
+     * page's URL, the receiver device loads it, and the two halves then talk over the
+     * connection so the line-up can change without a reload.
+     */
+    function wirePresentation() {
+      if (!navigator.presentation || !navigator.presentation.receiver) return;
+      navigator.presentation.receiver.connectionList.then(function (list) {
+        var attach = function (connection) {
+          connection.addEventListener('message', function (event) {
+            try {
+              applyState(JSON.parse(event.data));
+            } catch (err) {
+              /* ignore anything that is not our JSON */
+            }
+          });
+          try { connection.send(JSON.stringify({ type: 'ready', host: HOST })); } catch (ignored) { /* noop */ }
+        };
+        list.connections.forEach(attach);
+        list.addEventListener('connectionavailable', function (event) { attach(event.connection); });
+      }).catch(function () { /* not a presentation context after all */ });
+    }
+
+    // -- boot -----------------------------------------------------------------
+
+    msgUrl.textContent = location.origin + location.pathname + '?c=channel1,channel2';
+
+    if (!HOST) {
+      showMessage('Twitch embeds need a real hostname for their parent= parameter, so this page '
+        + 'has to be served over http(s) — opening the file directly will not play anything.', true);
+      return;
+    }
+
+    loadSdk().then(function (ctor) {
+      Player = ctor;
+      wirePresentation();
+      applyState(stateFromQuery());
+      if (!state.channels.length) {
+        showMessage('Waiting for a line-up… open this page with ?c=channel1,channel2, or cast to it '
+          + 'from the Twitch Multi-View userscript.');
+      }
+    });
+
+    // Keep the picture alive on TV browsers that reflow lazily after an HDMI wake-up.
+    window.addEventListener('resize', function () {
+      if (state.channels.length) applyGridTemplate(state.channels.length);
+    });
+  })();
+  </script>
+</body>
+</html>
