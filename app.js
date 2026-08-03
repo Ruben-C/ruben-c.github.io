@@ -31,6 +31,11 @@
   const LAYOUTS = ['auto', '2x2', 'focus'];
   const FOLLOWED_TTL = 90e3;
 
+  /* A paused player is nudged back to life by the sweep in init(). Bounded so
+   * that a player paused for a reason we cannot fix — a mature-content gate,
+   * a sub-only stream — is not hammered with play() once a second forever. */
+  const RESUME_TRIES = 5;
+
   const LS_SESSION = 'tmvtv.session';
   const LS_AUTH = 'tmvtv.auth';
   const LS_RECENT = 'tmvtv.recent';
@@ -52,6 +57,7 @@
 
   const dom = {
     sink: $('#sink'),
+    app: $('#app'),
     stage: $('#stage'),
     empty: $('#empty'),
     emptyMsg: $('#empty-msg'),
@@ -171,11 +177,18 @@
 
   let toastTimer = null;
 
+  /* The toast and the hints share one strip beneath the stage and swap places,
+   * because a toast floating over the grid occludes the players and pauses
+   * them. See the hints/toast comment in index.html. */
   function toast(message, kind) {
     dom.toast.textContent = message;
     dom.toast.className = kind || '';
+    dom.hints.classList.add('hidden');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => dom.toast.classList.add('hidden'), 3200);
+    toastTimer = setTimeout(() => {
+      dom.toast.classList.add('hidden');
+      dom.hints.classList.remove('hidden');
+    }, 3200);
   }
 
   // ------------------------------------------------------------------- tile
@@ -188,6 +201,11 @@
       this.id = 'tmv-player-' + (++tileSeq);
       this.muted = true;
       this.online = true;
+      this.paused = false;
+      this.everPlayed = false;
+      this.resumeTries = 0;
+      this.remounted = false;
+      this.mountedAt = Date.now();   // reset by mount(); see resume()
       this.qualities = [];
       this.appliedQuality = null;
       this.build();
@@ -220,6 +238,7 @@
     }
 
     mount() {
+      this.mountedAt = Date.now();
       if (SDK_READY) {
         this.mountSdk();
       } else {
@@ -252,9 +271,116 @@
         this.qualities = safeCall(() => this.player.getQualities()) || [];
         this.applyQuality();
         this.setOnline(true);
+        this.markPlaying();
       });
       this.player.addEventListener(P.ONLINE, () => this.setOnline(true));
       this.player.addEventListener(P.OFFLINE, () => this.setOnline(false));
+
+      /* Nothing in this app ever asks a player to pause — Play/Pause on the
+       * remote is bound to the audio swap. So a PAUSE here always means Twitch
+       * paused itself, and the only cause seen in practice is the player being
+       * covered up. Guarded because an older SDK may not define the constant,
+       * and addEventListener(undefined, …) would silently never fire. */
+      if (P.PAUSE) this.player.addEventListener(P.PAUSE, () => { this.paused = true; });
+      if (P.PLAY) this.player.addEventListener(P.PLAY, () => this.markPlaying());
+    }
+
+    markPlaying() {
+      this.paused = false;
+      this.everPlayed = true;
+      this.resumeTries = 0;
+      this.remounted = false;
+    }
+
+    /* isPaused() reads state the embed already mirrors into this page, so this
+     * is cheap enough to poll once a second. It throws while the player is
+     * being torn down, hence the fall back to the event-driven flag. */
+    isPausedNow() {
+      const paused = safeCall(() => this.player.isPaused());
+      return paused === undefined ? this.paused : !!paused;
+    }
+
+    /* Showing nothing, and will not fix itself.
+     *
+     * Two different states land here and only one of them is what isPaused()
+     * reports. Measured in Chrome: isPaused() is false for a player that was
+     * never allowed to start — it only goes true after a real pause. So a tile
+     * that has never once reported playback is judged stuck on that basis
+     * instead, or a refused autoplay would sit behind a play button forever
+     * with nothing retrying it.
+     *
+     * The grace period leaves the embed's own autoplay negotiation alone: a
+     * player that is still starting up looks exactly like a stuck one. */
+    isStuck() {
+      if (!this.player || !this.online) return false;
+      if (Date.now() - this.mountedAt < 8000) return false;
+      return this.everPlayed ? this.isPausedNow() : true;
+    }
+
+    /* The embed never restarts itself once it has paused, so the app has to
+     * ask. No-op in the iframe fallback, which exposes no player API — there
+     * the only cure is a reload. */
+    resume() {
+      if (!this.player || !this.online) return;
+      if (Date.now() - this.mountedAt < 8000) return;
+
+      if (!this.isStuck()) {
+        this.markPlaying();
+        return;
+      }
+      this.paused = true;
+
+      /* Last resort, once per pause, after play() has been ignored five times:
+       * build the player again. Autoplay is the one path known to work on this
+       * hardware, so give the tile a fresh one rather than leave a black box on
+       * screen. Bounded by `remounted` — a tile that cannot play at all (sub
+       * only, mature gate) must not sit in a reload loop. */
+      if (this.resumeTries >= RESUME_TRIES) {
+        if (!this.remounted) {
+          this.remounted = true;
+          this.remount();
+        }
+        return;
+      }
+
+      this.resumeTries++;
+      safeCall(() => this.player.play());
+      // Re-assert the exclusive-audio invariant: whatever restarted the player
+      // must not be allowed to bring a second stream back audible.
+      this.setMuted(this.muted);
+    }
+
+    /* The Embed SDK does not fill the container it is given, it REPLACES that
+     * node with one of its own carrying the same id — so the playerEl captured
+     * in build() is a detached node from the moment the player mounts. Anything
+     * that needs the live container has to resolve it by id. Measured in
+     * Chrome; a stale reference here silently produced a tile that never came
+     * back, because replaceWith() on a detached node does nothing. */
+    liveContainer() {
+      return document.getElementById(this.id) || this.playerEl;
+    }
+
+    /* Deliberately throws the iframe away, which is the one case where that is
+     * wanted — everywhere else in this app tiles are never re-parented, because
+     * moving an element containing an iframe reloads it. */
+    remount() {
+      if (this.player) safeCall(() => this.player.destroy());
+      this.player = null;
+      this.qualities = [];
+      this.appliedQuality = null;
+      this.resumeTries = 0;
+      // The replacement is a different player and gets judged on its own
+      // record, not on what the one before it managed. `remounted` is
+      // deliberately NOT cleared here — that is the loop guard.
+      this.everPlayed = false;
+      this.paused = false;
+
+      const fresh = el('div', { class: 'tile-player', id: this.id });
+      const current = this.liveContainer();
+      if (current && current.parentNode) current.replaceWith(fresh);
+      else this.videoEl.insertBefore(fresh, this.offlineEl);   // belt and braces
+      this.playerEl = fresh;
+      this.mount();
     }
 
     /* Used when the Embed SDK could not load. Audio switching rebuilds the
@@ -396,6 +522,63 @@
 
   function reclaimFocus() {
     if (document.activeElement !== dom.sink) dom.sink.focus();
+  }
+
+  // --------------------------------------------------------------- playback
+
+  /* Shrink the stage so an open panel sits BESIDE the tiles rather than over
+   * them. A player that gets covered is a player Twitch pauses — this is the
+   * fix for the menu killing every stream, and the resume path below is only
+   * the safety net. Resizing tiles is free; re-parenting them is what would
+   * reload the iframes, and nothing here moves an element. */
+  let shiftTimer = null;
+
+  function setShift(side) {
+    clearTimeout(shiftTimer);
+    if (side) snapClosedPanels();
+    dom.app.classList.toggle('shift-left', side === 'left');
+    dom.app.classList.toggle('shift-right', side === 'right');
+  }
+
+  /* Widening the stage the instant a panel starts sliding away puts tiles back
+   * under a panel that is still on screen for another 180ms — brief, but it is
+   * the very thing being fixed. So the stage stays narrow until the slide is
+   * over, and only then do the players get their nudge. */
+  function unshiftAfterSlide() {
+    clearTimeout(shiftTimer);
+    shiftTimer = setTimeout(() => {
+      dom.app.classList.remove('shift-left', 'shift-right');
+      resumePlayback(true);
+    }, 240);
+  }
+
+  /* Going straight from one panel to the other would otherwise leave the
+   * outgoing one animating across a stage that has already moved under it.
+   * Take it off-screen in a single frame instead: kill the transition, force
+   * the layout to commit, then hand the transition back for the next open. */
+  function snapClosedPanels() {
+    for (const panel of [dom.menu, dom.sidebar]) {
+      if (panel.classList.contains('open')) continue;
+      panel.classList.add('snap');
+      void panel.offsetWidth;
+      panel.classList.remove('snap');
+    }
+  }
+
+  /* The setup screen is the one overlay that genuinely has to cover the
+   * screen — a sign-in code has to be legible from the sofa — so streams do
+   * pause there, and this is what starts them again afterwards. `force` clears
+   * the attempt budget, for when we know the cause has just gone away. */
+  function resumePlayback(force) {
+    if (state.mode === 'setup') return;
+    for (const tile of state.tiles) {
+      if (force) tile.resumeTries = 0;
+      tile.resume();
+    }
+  }
+
+  function anyPaused() {
+    return state.tiles.some((tile) => tile.isStuck());
   }
 
   // ------------------------------------------------------------------- grid
@@ -609,6 +792,17 @@
       }
     });
 
+    /* Only offered when there is something to fix. Streams should never still
+     * be paused by the time this menu is on screen, so if this item appears at
+     * all it means the automatic resume gave up — a mature-content gate or a
+     * sub-only stream, neither of which a D-pad can clear. */
+    if (anyPaused()) {
+      items.push({
+        label: 'Restart paused streams',
+        run: () => { closeMenu(); resumePlayback(true); }
+      });
+    }
+
     items.push({
       label: 'Add or remove channels…',
       run: () => { closeMenu(); openSidebar(); }
@@ -629,7 +823,8 @@
     state.menu = { items: items, sel: 0 };
     state.mode = 'menu';
     dom.menuTitle.textContent = tile ? tile.channel : 'Multi-View';
-    dom.menu.classList.remove('hidden');
+    setShift('right');   // before .open, so the tiles are clear of the panel
+    dom.menu.classList.add('open');
     renderSelection();
     refreshMenu();
   }
@@ -650,7 +845,8 @@
   }
 
   function closeMenu() {
-    dom.menu.classList.add('hidden');
+    dom.menu.classList.remove('open');
+    unshiftAfterSlide();
     state.mode = 'grid';
     renderSelection();
   }
@@ -665,6 +861,7 @@
   function openSidebar() {
     state.mode = 'sidebar';
     state.side.sel = 0;
+    setShift('left');    // before .open, so the tiles are clear of the panel
     dom.sidebar.classList.add('open');
     renderSelection();
     renderSidebar();
@@ -673,6 +870,7 @@
 
   function closeSidebar() {
     dom.sidebar.classList.remove('open');
+    unshiftAfterSlide();
     state.mode = 'grid';
     renderSelection();
   }
@@ -945,6 +1143,7 @@
     dom.setup.classList.add('hidden');
     state.mode = 'grid';
     renderSelection();
+    resumePlayback(true);
   }
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1165,7 +1364,19 @@
      * iframe takes focus — the focusin listener alone cannot. One second is
      * the worst-case dead-remote window, and the failure it prevents is not
      * diagnosable from a sofa. */
-    setInterval(hardenFrames, 1000);
+    setInterval(() => {
+      hardenFrames();
+      /* Second job for the same tick: restart anything Twitch paused behind
+       * our back. The UI no longer covers the players, so in normal use this
+       * finds nothing — it is what recovers the grid after the sign-in screen,
+       * an Android TV screensaver, or the app being backgrounded. */
+      resumePlayback(false);
+    }, 1000);
+
+    // Coming back from the launcher pauses everything; do not wait a second.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) resumePlayback(true);
+    });
   }
 
   if (document.readyState === 'loading') {

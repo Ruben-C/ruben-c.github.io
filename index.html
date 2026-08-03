@@ -13,6 +13,12 @@
       background: #0a0a0d;
       color: #efeff1;
       font-family: 'Roobert', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+      /* One width for both side panels, so the stage can be shrunk by exactly
+         the amount a panel takes — see the #app shift rules below. */
+      --panel-w: max(32vw, 22rem);
+      --safe-x: 3.5vw;
+      --safe-y: 3.5vh;
     }
     * { box-sizing: border-box; }
     body { margin: 0; height: 100vh; overflow: hidden; }
@@ -21,9 +27,22 @@
        safe area rather than trusting the panel. */
     #app {
       position: fixed; inset: 0;
-      padding: 3.5vh 3.5vw;
+      padding: var(--safe-y) var(--safe-x);
       display: flex; flex-direction: column; gap: 1rem;
     }
+
+    /* THE UI NEVER COVERS A PLAYER.
+       Anything painted over the player makes Twitch's IntersectionObserver v2
+       check report isVisible:false, and Twitch does not merely refuse to start
+       — it PAUSES a player that is already running, and never resumes it. A
+       full-screen modal scrim over the grid therefore killed all four streams
+       the moment the menu opened. So the sidebar and the menu are side panels
+       and the stage is shrunk out from under them instead.
+       Resizing a tile is free; only RE-PARENTING one reloads its iframe.
+       Deliberately not transitioned: the stage must be clear of the panel
+       BEFORE the panel slides in, or the overlap pauses the players anyway. */
+    #app.shift-left  { padding-left:  calc(var(--panel-w) + 1.5rem); }
+    #app.shift-right { padding-right: calc(var(--panel-w) + 1.5rem); }
 
     /* The focus sink. Holds document.activeElement forever so no cross-origin
        player iframe can ever steal it and swallow the remote. */
@@ -136,14 +155,17 @@
     /* ------------------------------------------------------------- sidebar */
     #sidebar {
       position: fixed; top: 0; bottom: 0; left: 0;
-      width: 32vw; min-width: 22rem;
+      width: var(--panel-w);
       background: #17171b; border-right: 0.15rem solid #2f2f37;
-      padding: 3.5vh 1.5rem;
+      padding: var(--safe-y) 1.5rem;
       display: flex; flex-direction: column; gap: .8rem;
       transform: translateX(-102%); transition: transform .18s ease;
       z-index: 20;
     }
     #sidebar.open { transform: translateX(0); }
+    /* Applied for a single frame to drop a panel off-screen without animating
+       it across the grid — see snapClosedPanels(). */
+    #sidebar.snap, #menu.snap { transition: none; }
     #sidebar h2 { font-size: 1.5rem; margin: 0; font-weight: 800; }
     #side-sub { font-size: .9rem; color: #adadb8; margin: 0; }
     #side-list { flex: 1; overflow: hidden; display: flex; flex-direction: column; gap: .35rem; }
@@ -162,16 +184,24 @@
     .row-meta { font-size: .8rem; color: #adadb8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .row-mark { font-size: 1.2rem; font-weight: 800; color: #a970ff; flex-shrink: 0; }
 
-    /* ---------------------------------------------------------------- menu */
+    /* ---------------------------------------------------------------- menu
+       A right-hand panel, mirroring the sidebar — NOT a centred card behind a
+       scrim. The old scrim covered the players and paused every stream; see
+       the #app shift rules. It is translated off-screen rather than
+       display:none so the slide can be animated, and off-screen means it
+       paints nothing over the grid. */
     #menu {
-      position: fixed; inset: 0; z-index: 30;
-      display: flex; align-items: center; justify-content: center;
-      background: rgba(0,0,0,.72);
+      position: fixed; top: 0; bottom: 0; right: 0; z-index: 30;
+      width: var(--panel-w);
+      background: #17171b; border-left: 0.15rem solid #2f2f37;
+      padding: var(--safe-y) 1.5rem;
+      display: flex; flex-direction: column;
+      transform: translateX(102%); transition: transform .18s ease;
     }
+    #menu.open { transform: translateX(0); }
     #menu-card {
-      background: #17171b; border: 0.15rem solid #2f2f37; border-radius: .8rem;
-      padding: 1.6rem; min-width: 26rem; max-width: 40rem;
       display: flex; flex-direction: column; gap: .35rem;
+      min-height: 0; overflow: hidden;
     }
     #menu-title { font-size: 1.4rem; font-weight: 800; margin: 0 0 .8rem; }
     .mi {
@@ -204,21 +234,28 @@
     #setup-url { font-size: 1.5rem; font-weight: 700; color: #efeff1; }
     #setup-actions { display: flex; flex-direction: column; gap: .35rem; width: 26rem; margin-top: .6rem; }
 
-    /* --------------------------------------------------------------- hints */
+    /* ------------------------------------------------------- hints / toast
+       Both live in one strip below the stage, and only ever one is shown. The
+       toast used to be `position: fixed; bottom: 8vh`, which floated it over
+       the bottom of the tiles — occlusion, and so a 3-second pause of every
+       stream every time anything was announced. In flow it can only push the
+       stage up, never cover it. The min-height keeps a one-line toast from
+       resizing the grid at all. */
+    #footer {
+      flex-shrink: 0; min-height: 3.4rem;
+      display: flex; align-items: center; justify-content: center;
+    }
     #hints {
       display: flex; gap: 1.4rem; align-items: center; justify-content: center;
-      font-size: .85rem; color: #8a8a94; flex-shrink: 0;
+      font-size: .85rem; color: #8a8a94;
     }
     #hints b { color: #d8d8e0; font-weight: 700; }
     #hints span { white-space: nowrap; }
 
-    /* --------------------------------------------------------------- toast */
     #toast {
-      position: fixed; left: 50%; bottom: 8vh; transform: translateX(-50%);
       background: #26262c; border: 0.15rem solid #3f3f47; border-radius: .6rem;
-      padding: .8rem 1.4rem; font-size: 1.05rem; font-weight: 600;
-      z-index: 50; max-width: 60vw; text-align: center;
-      transition: opacity .2s ease; pointer-events: none;
+      padding: .6rem 1.4rem; font-size: 1.05rem; font-weight: 600;
+      max-width: 80vw; text-align: center;
     }
     #toast.warn { border-color: #e3a133; }
     #toast.err  { border-color: #e33; }
@@ -236,12 +273,17 @@
       <p id="empty-msg">Press <b>OK</b> to open your channel list.</p>
     </div>
 
-    <div id="hints">
-      <span><b>OK</b> menu</span>
-      <span><b>◀ ▲ ▼ ▶</b> select</span>
-      <span><b>Back</b> close</span>
-      <span><b>Play/Pause</b> audio</span>
-      <span><b>⏩ ⏪</b> layout</span>
+    <!-- One strip, two occupants: the toast replaces the hints while it is up,
+         so neither can ever end up painted over a player. -->
+    <div id="footer">
+      <div id="hints">
+        <span><b>OK</b> menu</span>
+        <span><b>◀ ▲ ▼ ▶</b> select</span>
+        <span><b>Back</b> close</span>
+        <span><b>Play/Pause</b> audio</span>
+        <span><b>⏩ ⏪</b> layout</span>
+      </div>
+      <div id="toast" class="hidden"></div>
     </div>
   </div>
 
@@ -251,7 +293,8 @@
     <div id="side-list"></div>
   </aside>
 
-  <div id="menu" class="hidden">
+  <!-- Slid off-screen by transform, not display:none — see the #menu CSS. -->
+  <div id="menu">
     <div id="menu-card">
       <h3 id="menu-title"></h3>
       <div id="menu-list"></div>
@@ -261,8 +304,6 @@
   <div id="setup" class="hidden">
     <div id="setup-card"></div>
   </div>
-
-  <div id="toast" class="hidden"></div>
 
   <script src="https://player.twitch.tv/js/embed/v1.js"></script>
   <script src="app.js"></script>
