@@ -54,37 +54,44 @@
     #stage.lay-focus.n-4 { grid-template-rows: 1fr 1fr 1fr; }
     #stage.lay-focus .tile--big { grid-column: 1; grid-row: 1 / -1; }
 
-    /* ---------------------------------------------------------------- tile */
+    /* ---------------------------------------------------------------- tile
+       The styling here is constrained by Twitch's autoplay check, which reads
+       Chromium's IntersectionObserver v2 `isVisible` on the player. Measured on
+       an Android TV WebView, each of these makes isVisible false — and so
+       silently kills autoplay:
+         - a `border` on any ancestor of the player
+         - `overflow:hidden` together with `border-radius`
+         - ANY element painted over the player, even pointer-events:none
+       Hence: rings are box-shadow (verified safe), the video is never clipped,
+       and the label bar is a real grid row BELOW the video rather than an
+       overlay. Do not "tidy" this back into an overlay. */
     .tile {
       position: relative; min-width: 0; min-height: 0;
-      background: #000; border-radius: 0.6rem; overflow: hidden;
-      border: 0.25rem solid #26262c;
-      transition: border-color .12s ease, transform .12s ease;
+      display: grid; grid-template-rows: 1fr auto;
+      background: #000;
+      box-shadow: 0 0 0 0.2rem #26262c;
+      transition: box-shadow .12s ease;
     }
-    /* Sofa-distance selection: a 1px border is invisible from 3 metres, so the
-       selected tile gets a thick ring plus a glow and a slight lift. */
+    /* Sofa-distance selection: a thin line is invisible from 3 metres, so the
+       selected tile gets a thick ring — drawn outside the video, never over it.
+       The ring must also stay INSIDE the grid gap: a wider glow spilling onto
+       the neighbouring tiles occludes THEIR players, and occlusion is what makes
+       Twitch refuse to autoplay. Measured on a Shield: a 3rem glow here stopped
+       all three other tiles from ever starting. */
     .tile--sel {
-      border-color: #a970ff;
-      box-shadow: 0 0 0 0.35rem rgba(169,112,255,.35), 0 0 3rem rgba(169,112,255,.45);
-      transform: scale(1.012);
+      box-shadow: 0 0 0 0.3rem #a970ff;
       z-index: 2;
     }
 
-    /* The player lives here. pointer-events:none is load-bearing — it is what
-       stops the cross-origin iframe taking focus and killing the remote. */
-    .tile-video {
-      position: absolute; inset: 0;
-      pointer-events: none;
-    }
+    /* The player fills the 1fr row. Nothing may be drawn on top of it. */
+    .tile-video { position: relative; min-height: 0; }
+    .tile-player { position: absolute; inset: 0; }
     .tile-video iframe { width: 100%; height: 100%; border: 0; display: block; }
 
     .tile-bar {
-      position: absolute; left: 0; right: 0; bottom: 0;
       display: flex; align-items: center; gap: .6rem;
-      padding: .5rem .8rem;
-      background: linear-gradient(to top, rgba(0,0,0,.85), rgba(0,0,0,0));
+      padding: .45rem .7rem; background: #101014;
       font-size: .95rem; font-weight: 600;
-      pointer-events: none;
     }
     .tile-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .tile-badges { margin-left: auto; display: flex; gap: .4rem; flex-shrink: 0; }
@@ -99,16 +106,18 @@
     .badge--q     { background: rgba(255,255,255,.14); color: #d8d8e0; }
     .badge--off   { background: #e33; color: #fff; }
 
-    /* Tile number, for the "which one is 2?" glance. */
+    /* Tile number, for the "which one is 2?" glance. Lives in the bar, not
+       over the video — see the tile comment above. */
     .tile-num {
-      position: absolute; top: .7rem; left: .8rem;
-      min-width: 1.9rem; height: 1.9rem; padding: 0 .5rem;
+      min-width: 1.7rem; height: 1.7rem; padding: 0 .45rem;
       display: flex; align-items: center; justify-content: center;
-      border-radius: .45rem; background: rgba(0,0,0,.7);
-      font-size: 1rem; font-weight: 800;
+      border-radius: .35rem; background: #2f2f37;
+      font-size: .95rem; font-weight: 800; flex-shrink: 0;
     }
     .tile--sel .tile-num { background: #a970ff; color: #1a0033; }
 
+    /* Only ever shown when the stream is offline, so there is no autoplay to
+       block by covering the player. */
     .tile-offline {
       position: absolute; inset: 0;
       display: flex; flex-direction: column; align-items: center; justify-content: center;

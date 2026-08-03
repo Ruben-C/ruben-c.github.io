@@ -197,19 +197,25 @@
     }
 
     build() {
-      this.videoEl = el('div', { class: 'tile-video', id: this.id });
-      this.numEl = el('div', { class: 'tile-num' });
-      this.nameEl = el('div', { class: 'tile-name', text: this.channel });
-      this.badgesEl = el('div', { class: 'tile-badges' });
+      // The SDK owns playerEl and may replace its contents, so the offline
+      // card is a sibling rather than a child of it.
+      this.playerEl = el('div', { class: 'tile-player', id: this.id });
       this.offlineEl = el('div', { class: 'tile-offline hidden' }, [
         el('div', { text: 'Offline' }),
         el('div', { text: this.channel })
       ]);
+      this.videoEl = el('div', { class: 'tile-video' }, [this.playerEl, this.offlineEl]);
+
+      this.numEl = el('div', { class: 'tile-num' });
+      this.nameEl = el('div', { class: 'tile-name', text: this.channel });
+      this.badgesEl = el('div', { class: 'tile-badges' });
+
+      /* The bar is a real grid row BENEATH the video, not an overlay. Anything
+       * painted over the player makes Twitch's autoplay check fail — see the
+       * tile comment in index.html. */
       this.el = el('div', { class: 'tile' }, [
         this.videoEl,
-        this.offlineEl,
-        this.numEl,
-        el('div', { class: 'tile-bar' }, [this.nameEl, this.badgesEl])
+        el('div', { class: 'tile-bar' }, [this.numEl, this.nameEl, this.badgesEl])
       ]);
     }
 
@@ -261,7 +267,7 @@
         tabindex: '-1',
         scrolling: 'no'
       });
-      this.videoEl.appendChild(this.frame);
+      this.playerEl.appendChild(this.frame);
       if (!state.warnedFallback) {
         state.warnedFallback = true;
         toast('Twitch Embed SDK unavailable — quality control is off and audio switching reloads a stream.', 'warn');
