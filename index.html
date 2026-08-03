@@ -2,7 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- NOT device-width, and this is load-bearing. The Shield reports a 960x540
+       CSS viewport (4K panel, 960dp), which makes a tile in a 2x2 measure
+       441x191 CSS px — under Twitch's 400x300 embed minimum, so EVERY tile is
+       refused autoplay with "minimum requirements for autoplay were not met:
+       size". Declaring 1920 doubles every CSS measurement while the WebView
+       scales the page back down to fit, so the picture is physically identical
+       (all sizing here is vh/vw) and the tiles measure 881x382. Verified on the
+       Shield: 20 size rejections before, 0 after, three streams playing.
+       Needs useWideViewPort=true in the shell, which is already set. -->
+  <meta name="viewport" content="width=1920, viewport-fit=cover">
   <title>Twitch Multi-View for TV</title>
   <style>
     /* ---------------------------------------------------------------- base */

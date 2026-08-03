@@ -36,6 +36,19 @@
    * a sub-only stream — is not hammered with play() once a second forever. */
   const RESUME_TRIES = 5;
 
+  /* Two different waits, because the two failures are not alike.
+   *
+   * A tile that has already played once and then stopped is the bug this all
+   * exists for, and it should come back quickly.
+   *
+   * A tile that has NEVER played may simply still be starting, and on a Shield
+   * with three tiles that was measured taking upwards of 30 seconds from load.
+   * Treating it as broken any earlier means tearing down a player that was
+   * about to work — which is worse than waiting. A minute is deliberately far
+   * past anything observed. */
+  const RESUME_GRACE = 8e3;
+  const START_GRACE = 60e3;
+
   const LS_SESSION = 'tmvtv.session';
   const LS_AUTH = 'tmvtv.auth';
   const LS_RECENT = 'tmvtv.recent';
@@ -309,12 +322,14 @@
      * instead, or a refused autoplay would sit behind a play button forever
      * with nothing retrying it.
      *
-     * The grace period leaves the embed's own autoplay negotiation alone: a
-     * player that is still starting up looks exactly like a stuck one. */
+     * The grace periods leave the embed's own autoplay negotiation alone: a
+     * player that is still starting up looks exactly like a stuck one, and the
+     * two cases get very different waits — see RESUME_GRACE / START_GRACE. */
     isStuck() {
       if (!this.player || !this.online) return false;
-      if (Date.now() - this.mountedAt < 8000) return false;
-      return this.everPlayed ? this.isPausedNow() : true;
+      const age = Date.now() - this.mountedAt;
+      if (this.everPlayed) return age >= RESUME_GRACE && this.isPausedNow();
+      return age >= START_GRACE;
     }
 
     /* The embed never restarts itself once it has paused, so the app has to
@@ -322,10 +337,14 @@
      * the only cure is a reload. */
     resume() {
       if (!this.player || !this.online) return;
-      if (Date.now() - this.mountedAt < 8000) return;
 
       if (!this.isStuck()) {
-        this.markPlaying();
+        /* Only a player known to be running may clear the counters. A tile that
+         * is merely still inside its start grace must NOT be recorded as having
+         * played, or everPlayed would latch on a player that never started and
+         * isPausedNow() — false for exactly that case — would disable the whole
+         * ladder for it. */
+        if (this.everPlayed) this.markPlaying();
         return;
       }
       this.paused = true;
