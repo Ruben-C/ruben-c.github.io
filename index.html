@@ -1,369 +1,261 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="strict-origin">
-  <title>Twitch Multi-View — TV receiver</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Twitch Multi-View for TV</title>
   <style>
-    :root { color-scheme: dark; }
+    /* ---------------------------------------------------------------- base */
+    /* Type scales with viewport height so the same CSS is legible on a 720p
+       box and a 4K panel. Everything below is in rem. */
+    html {
+      font-size: 2.1vh;
+      background: #0a0a0d;
+      color: #efeff1;
+      font-family: 'Roobert', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    }
     * { box-sizing: border-box; }
-    html, body {
-      margin: 0; height: 100%; background: #000; color: #efeff1; overflow: hidden;
-      font: 14px/1.4 Inter, Roobert, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    body { margin: 0; height: 100vh; overflow: hidden; }
+
+    /* Many TVs still crop the edges of the signal. Keep everything inside a
+       safe area rather than trusting the panel. */
+    #app {
+      position: fixed; inset: 0;
+      padding: 3.5vh 3.5vw;
+      display: flex; flex-direction: column; gap: 1rem;
     }
 
-    #grid { position: absolute; inset: 0; display: grid; gap: 4px; padding: 4px; }
-    #grid:empty { display: none; }
+    /* The focus sink. Holds document.activeElement forever so no cross-origin
+       player iframe can ever steal it and swallow the remote. */
+    #sink {
+      position: fixed; width: 1px; height: 1px;
+      opacity: 0; pointer-events: none; border: 0;
+    }
+    #sink:focus { outline: none; }
 
-    .tile { position: relative; background: #0a0a0c; border-radius: 4px; overflow: hidden; min-width: 0; min-height: 0; }
-    .tile iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
-    .tile .mount { position: absolute; inset: 0; }
-    .tile .label {
-      position: absolute; left: 8px; bottom: 8px; z-index: 2;
-      background: rgba(0,0,0,.62); color: #efeff1; padding: 3px 9px; border-radius: 12px;
-      font-size: 13px; font-weight: 600; letter-spacing: .2px; pointer-events: none;
-      transition: opacity .4s ease;
-    }
-    .tile .label.audio { background: rgba(0,179,126,.85); color: #fff; }
-    .labels-off .tile .label { display: none; }
+    .hidden { display: none !important; }
 
-    #msg {
-      position: absolute; inset: 0; display: flex; flex-direction: column;
-      align-items: center; justify-content: center; gap: 14px; padding: 6vmin; text-align: center;
+    /* --------------------------------------------------------------- stage */
+    #stage {
+      flex: 1; min-height: 0;
+      display: grid; gap: 1rem;
     }
-    #msg.hidden { display: none; }
-    #msg h1 { margin: 0; font-size: clamp(20px, 3.4vw, 40px); color: #bf94ff; }
-    #msg p { margin: 0; max-width: 46em; color: #adadb8; font-size: clamp(13px, 1.5vw, 20px); }
-    #msg code {
-      background: #1f1f23; border: 1px solid #3a3a42; border-radius: 4px;
-      padding: 2px 7px; font-family: ui-monospace, Menlo, Consolas, monospace; color: #efeff1;
+    #stage.lay-solo  { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+    #stage.lay-2x1   { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
+    #stage.lay-2x2   { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+    /* Three tiles in a 2x2 would leave a hole; let the last one fill the row. */
+    #stage.lay-2x2.n-3 .tile:last-child { grid-column: span 2; }
+
+    /* Focus layouts: one large tile plus a rail down the right. The rail row
+       count follows the tile count so the rail always fills its column. */
+    #stage.lay-focus { grid-template-columns: 3fr 1fr; }
+    #stage.lay-focus.n-2 { grid-template-rows: 1fr; }
+    #stage.lay-focus.n-3 { grid-template-rows: 1fr 1fr; }
+    #stage.lay-focus.n-4 { grid-template-rows: 1fr 1fr 1fr; }
+    #stage.lay-focus .tile--big { grid-column: 1; grid-row: 1 / -1; }
+
+    /* ---------------------------------------------------------------- tile */
+    .tile {
+      position: relative; min-width: 0; min-height: 0;
+      background: #000; border-radius: 0.6rem; overflow: hidden;
+      border: 0.25rem solid #26262c;
+      transition: border-color .12s ease, transform .12s ease;
     }
-    #msg .warn { color: #ffb545; }
+    /* Sofa-distance selection: a 1px border is invisible from 3 metres, so the
+       selected tile gets a thick ring plus a glow and a slight lift. */
+    .tile--sel {
+      border-color: #a970ff;
+      box-shadow: 0 0 0 0.35rem rgba(169,112,255,.35), 0 0 3rem rgba(169,112,255,.45);
+      transform: scale(1.012);
+      z-index: 2;
+    }
+
+    /* The player lives here. pointer-events:none is load-bearing — it is what
+       stops the cross-origin iframe taking focus and killing the remote. */
+    .tile-video {
+      position: absolute; inset: 0;
+      pointer-events: none;
+    }
+    .tile-video iframe { width: 100%; height: 100%; border: 0; display: block; }
+
+    .tile-bar {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      display: flex; align-items: center; gap: .6rem;
+      padding: .5rem .8rem;
+      background: linear-gradient(to top, rgba(0,0,0,.85), rgba(0,0,0,0));
+      font-size: .95rem; font-weight: 600;
+      pointer-events: none;
+    }
+    .tile-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tile-badges { margin-left: auto; display: flex; gap: .4rem; flex-shrink: 0; }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: .3rem;
+      padding: .18rem .6rem; border-radius: 999px;
+      font-size: .8rem; font-weight: 700; letter-spacing: .02em;
+    }
+    .badge--audio { background: #00b37e; color: #00120c; }
+    .badge--muted { background: rgba(255,255,255,.14); color: #b8b8c0; }
+    .badge--q     { background: rgba(255,255,255,.14); color: #d8d8e0; }
+    .badge--off   { background: #e33; color: #fff; }
+
+    /* Tile number, for the "which one is 2?" glance. */
+    .tile-num {
+      position: absolute; top: .7rem; left: .8rem;
+      min-width: 1.9rem; height: 1.9rem; padding: 0 .5rem;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: .45rem; background: rgba(0,0,0,.7);
+      font-size: 1rem; font-weight: 800;
+    }
+    .tile--sel .tile-num { background: #a970ff; color: #1a0033; }
+
+    .tile-offline {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: .5rem; background: #101014; color: #8a8a94;
+      font-size: 1.1rem; font-weight: 600;
+    }
+
+    /* --------------------------------------------------------------- empty */
+    #empty {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 1.2rem; text-align: center;
+    }
+    #empty h1 { font-size: 2.6rem; margin: 0; font-weight: 800; }
+    #empty p  { font-size: 1.15rem; margin: 0; color: #adadb8; max-width: 34rem; line-height: 1.5; }
+
+    /* ------------------------------------------------------------- sidebar */
+    #sidebar {
+      position: fixed; top: 0; bottom: 0; left: 0;
+      width: 32vw; min-width: 22rem;
+      background: #17171b; border-right: 0.15rem solid #2f2f37;
+      padding: 3.5vh 1.5rem;
+      display: flex; flex-direction: column; gap: .8rem;
+      transform: translateX(-102%); transition: transform .18s ease;
+      z-index: 20;
+    }
+    #sidebar.open { transform: translateX(0); }
+    #sidebar h2 { font-size: 1.5rem; margin: 0; font-weight: 800; }
+    #side-sub { font-size: .9rem; color: #adadb8; margin: 0; }
+    #side-list { flex: 1; overflow: hidden; display: flex; flex-direction: column; gap: .35rem; }
+
+    .row {
+      display: flex; align-items: center; gap: .7rem;
+      padding: .65rem .8rem; border-radius: .5rem;
+      border: 0.2rem solid transparent;
+      font-size: 1rem;
+    }
+    .row--sel { background: rgba(169,112,255,.16); border-color: #a970ff; }
+    .row-dot { width: .7rem; height: .7rem; border-radius: 50%; background: #e91916; flex-shrink: 0; }
+    .row--offline .row-dot { background: #4a4a52; }
+    .row-main { min-width: 0; flex: 1; }
+    .row-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row-meta { font-size: .8rem; color: #adadb8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row-mark { font-size: 1.2rem; font-weight: 800; color: #a970ff; flex-shrink: 0; }
+
+    /* ---------------------------------------------------------------- menu */
+    #menu {
+      position: fixed; inset: 0; z-index: 30;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.72);
+    }
+    #menu-card {
+      background: #17171b; border: 0.15rem solid #2f2f37; border-radius: .8rem;
+      padding: 1.6rem; min-width: 26rem; max-width: 40rem;
+      display: flex; flex-direction: column; gap: .35rem;
+    }
+    #menu-title { font-size: 1.4rem; font-weight: 800; margin: 0 0 .8rem; }
+    .mi {
+      display: flex; align-items: center; gap: .8rem;
+      padding: .7rem .9rem; border-radius: .5rem;
+      border: 0.2rem solid transparent; font-size: 1.05rem; font-weight: 600;
+    }
+    .mi--sel { background: rgba(169,112,255,.16); border-color: #a970ff; }
+    .mi-val { margin-left: auto; color: #adadb8; font-weight: 600; }
+    .mi--danger.mi--sel { background: rgba(227,51,51,.18); border-color: #e33; }
+
+    /* --------------------------------------------------------------- setup */
+    #setup {
+      position: fixed; inset: 0; z-index: 40;
+      display: flex; align-items: center; justify-content: center;
+      background: #0a0a0d; padding: 3.5vh 3.5vw;
+    }
+    #setup-card {
+      max-width: 46rem; display: flex; flex-direction: column;
+      gap: 1rem; align-items: center; text-align: center;
+    }
+    #setup h1 { font-size: 2.2rem; margin: 0; font-weight: 800; }
+    #setup p { font-size: 1.1rem; color: #adadb8; margin: 0; line-height: 1.5; }
+    #setup-code {
+      font-size: 4.4rem; font-weight: 800; letter-spacing: .5rem;
+      padding: 1rem 2rem; border-radius: .8rem;
+      background: #17171b; border: 0.2rem solid #a970ff;
+      font-family: 'SF Mono', 'Consolas', monospace;
+    }
+    #setup-url { font-size: 1.5rem; font-weight: 700; color: #efeff1; }
+    #setup-actions { display: flex; flex-direction: column; gap: .35rem; width: 26rem; margin-top: .6rem; }
+
+    /* --------------------------------------------------------------- hints */
+    #hints {
+      display: flex; gap: 1.4rem; align-items: center; justify-content: center;
+      font-size: .85rem; color: #8a8a94; flex-shrink: 0;
+    }
+    #hints b { color: #d8d8e0; font-weight: 700; }
+    #hints span { white-space: nowrap; }
+
+    /* --------------------------------------------------------------- toast */
+    #toast {
+      position: fixed; left: 50%; bottom: 8vh; transform: translateX(-50%);
+      background: #26262c; border: 0.15rem solid #3f3f47; border-radius: .6rem;
+      padding: .8rem 1.4rem; font-size: 1.05rem; font-weight: 600;
+      z-index: 50; max-width: 60vw; text-align: center;
+      transition: opacity .2s ease; pointer-events: none;
+    }
+    #toast.warn { border-color: #e3a133; }
+    #toast.err  { border-color: #e33; }
   </style>
 </head>
 <body>
-  <div id="grid"></div>
-  <div id="msg">
-    <h1>Twitch Multi-View — TV receiver</h1>
-    <p id="msg-body">Waiting for a line-up…</p>
-    <p>Add channels to the address: <code id="msg-url">?c=channel1,channel2</code></p>
+  <!-- Permanently focused so no player iframe can take the remote. -->
+  <button id="sink" aria-hidden="true"></button>
+
+  <div id="app">
+    <div id="stage" class="lay-solo"></div>
+
+    <div id="empty">
+      <h1>Twitch Multi-View</h1>
+      <p id="empty-msg">Press <b>OK</b> to open your channel list.</p>
+    </div>
+
+    <div id="hints">
+      <span><b>OK</b> menu</span>
+      <span><b>◀ ▲ ▼ ▶</b> select</span>
+      <span><b>Back</b> close</span>
+      <span><b>Play/Pause</b> audio</span>
+      <span><b>⏩ ⏪</b> layout</span>
+    </div>
   </div>
 
-  <script>
-  /*
-   * Standalone receiver for the Twitch Multi-View userscript.
-   *
-   * It is deliberately dependency-free and self-contained so it can be dropped on any
-   * static HTTPS host (GitHub Pages, Netlify, an S3 bucket, …). It renders the same grid
-   * of official Twitch player embeds and takes its line-up from either
-   *
-   *   - the query string:  ?c=chan1,chan2&layout=2x2&audio=chan1&q=480p
-   *   - the Presentation API: live messages from the userscript's Cast button.
-   *
-   * `parent=` is derived from this page's own hostname, which is what makes the embeds
-   * legal here: it must match the host of the page doing the embedding, so the receiver
-   * only works from the domain you host it on (not from file://).
-   */
-  (function () {
-    'use strict';
+  <aside id="sidebar">
+    <h2>Channels</h2>
+    <p id="side-sub"></p>
+    <div id="side-list"></div>
+  </aside>
 
-    var SDK_URL = 'https://player.twitch.tv/js/embed/v1.js';
-    var CHANNEL_RE = /^[a-zA-Z0-9_]{3,25}$/;
+  <div id="menu" class="hidden">
+    <div id="menu-card">
+      <h3 id="menu-title"></h3>
+      <div id="menu-list"></div>
+    </div>
+  </div>
 
-    var gridEl = document.getElementById('grid');
-    var msgEl = document.getElementById('msg');
-    var msgBody = document.getElementById('msg-body');
-    var msgUrl = document.getElementById('msg-url');
+  <div id="setup" class="hidden">
+    <div id="setup-card"></div>
+  </div>
 
-    var HOST = location.hostname;
-    var Player = null;              // Twitch Embed SDK constructor, null in iframe mode
-    var tiles = new Map();          // channel -> tile
-    var uid = 0;
-    var state = { channels: [], layout: 'auto', audio: null, quality: null, labels: true };
+  <div id="toast" class="hidden"></div>
 
-    // -- helpers --------------------------------------------------------------
-
-    function normalize(name) {
-      var value = String(name || '').trim().toLowerCase();
-      return CHANNEL_RE.test(value) ? value : null;
-    }
-
-    function showMessage(text, warn) {
-      msgBody.textContent = text;
-      msgBody.className = warn ? 'warn' : '';
-      msgEl.classList.remove('hidden');
-    }
-
-    function hideMessage() {
-      msgEl.classList.add('hidden');
-    }
-
-    function loadSdk() {
-      return new Promise(function (resolve) {
-        if (window.Twitch && window.Twitch.Player) return resolve(window.Twitch.Player);
-        var done = function () {
-          resolve(window.Twitch && window.Twitch.Player ? window.Twitch.Player : null);
-        };
-        var script = document.createElement('script');
-        script.src = SDK_URL;
-        script.onload = done;
-        script.onerror = function () { resolve(null); };
-        document.head.appendChild(script);
-        setTimeout(done, 8000);   // CSP failures do not always fire onerror
-      });
-    }
-
-    // -- tiles ----------------------------------------------------------------
-
-    function frameUrl(channel, muted) {
-      return 'https://player.twitch.tv/?' + new URLSearchParams({
-        channel: channel,
-        parent: HOST,
-        muted: String(!!muted),
-        autoplay: 'true',
-        controls: 'false'
-      }).toString();
-    }
-
-    function pickQuality(list, target) {
-      var height = function (name) {
-        var match = String(name).match(/(\d+)p/);
-        return match ? Number(match[1]) : 0;
-      };
-      var wanted = height(target);
-      var ranked = list.filter(function (q) { return height(q) > 0; })
-        .sort(function (a, b) { return height(b) - height(a); });
-      if (!ranked.length) return null;
-      return ranked.find(function (q) { return height(q) <= wanted; }) || ranked[ranked.length - 1];
-    }
-
-    function makeTile(channel) {
-      var el = document.createElement('div');
-      el.className = 'tile';
-
-      var mount = document.createElement('div');
-      mount.className = 'mount';
-      mount.id = 'mount-' + (++uid);
-
-      var label = document.createElement('div');
-      label.className = 'label';
-      label.textContent = channel;
-
-      el.appendChild(mount);
-      el.appendChild(label);
-
-      var tile = { channel: channel, el: el, mount: mount, label: label, player: null, iframe: null, muted: true };
-
-      if (Player) {
-        try {
-          tile.player = new Player(mount.id, {
-            channel: channel,
-            parent: [HOST],
-            width: '100%',
-            height: '100%',
-            muted: true,
-            autoplay: true,
-            controls: false
-          });
-          tile.player.addEventListener(Player.PLAYING, function () {
-            applyMuted(tile);
-            applyQuality(tile);
-          });
-        } catch (err) {
-          tile.player = null;
-        }
-      }
-
-      if (!tile.player) {
-        var frame = document.createElement('iframe');
-        frame.src = frameUrl(channel, true);
-        frame.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
-        frame.setAttribute('allowfullscreen', '');
-        frame.frameBorder = '0';
-        frame.scrolling = 'no';
-        tile.iframe = frame;
-        mount.appendChild(frame);
-      }
-
-      return tile;
-    }
-
-    function destroyTile(tile) {
-      if (tile.player) {
-        try { tile.player.destroy(); } catch (ignored) { /* older SDK builds lack destroy() */ }
-      }
-      tile.el.remove();
-    }
-
-    function applyMuted(tile) {
-      var muted = state.audio !== tile.channel;
-      var changed = tile.muted !== muted;
-      tile.muted = muted;
-      tile.label.classList.toggle('audio', !muted);
-      if (!changed) return;
-      if (tile.player) {
-        try {
-          tile.player.setMuted(muted);
-          if (!muted && tile.player.getVolume() === 0) tile.player.setVolume(0.7);
-        } catch (ignored) { /* not ready yet; the PLAYING handler retries */ }
-      } else if (tile.iframe) {
-        // No JS bridge in fallback mode: mute state lives in the URL, so this reloads.
-        tile.iframe.src = frameUrl(tile.channel, muted);
-      }
-    }
-
-    function applyQuality(tile) {
-      if (!tile.player || !state.quality) return;
-      try {
-        var list = (tile.player.getQualities() || []).map(function (q) { return q.group || q.name; })
-          .filter(Boolean);
-        var want = pickQuality(list, state.quality);
-        if (want) tile.player.setQuality(want);
-      } catch (ignored) { /* quality list not loaded yet */ }
-    }
-
-    // -- layout ---------------------------------------------------------------
-
-    function applyGridTemplate(count) {
-      var cols;
-      var rows;
-      switch (state.layout) {
-        case 'rows': cols = '1fr'; rows = 'repeat(' + count + ', 1fr)'; break;
-        case 'cols': cols = 'repeat(' + count + ', 1fr)'; rows = '1fr'; break;
-        case '2x2': cols = 'repeat(2, 1fr)'; rows = 'repeat(' + Math.max(1, Math.ceil(count / 2)) + ', 1fr)'; break;
-        case '3x3': cols = 'repeat(3, 1fr)'; rows = 'repeat(' + Math.max(1, Math.ceil(count / 3)) + ', 1fr)'; break;
-        case 'focus': {
-          if (count === 1) { cols = '1fr'; rows = '1fr'; break; }
-          cols = 'minmax(0, 1fr) minmax(160px, 22%)';
-          rows = 'repeat(' + (count - 1) + ', minmax(0, 1fr))';
-          break;
-        }
-        default: {
-          var c = Math.ceil(Math.sqrt(count));
-          cols = 'repeat(' + c + ', minmax(0, 1fr))';
-          rows = 'repeat(' + Math.ceil(count / c) + ', minmax(0, 1fr))';
-        }
-      }
-      gridEl.style.gridTemplateColumns = cols;
-      gridEl.style.gridTemplateRows = rows;
-    }
-
-    function render() {
-      var wanted = state.channels.filter(Boolean);
-
-      // Only add and remove: an existing tile is never re-parented, because moving an
-      // iframe in the DOM reloads the player.
-      for (var entry of Array.from(tiles.entries())) {
-        if (wanted.indexOf(entry[0]) === -1) {
-          destroyTile(entry[1]);
-          tiles.delete(entry[0]);
-        }
-      }
-      wanted.forEach(function (channel, index) {
-        var tile = tiles.get(channel);
-        if (!tile) {
-          tile = makeTile(channel);
-          tiles.set(channel, tile);
-          gridEl.appendChild(tile.el);
-        }
-        tile.el.style.order = String(index);
-        tile.el.style.gridArea = '';
-      });
-
-      document.body.classList.toggle('labels-off', !state.labels);
-
-      if (!wanted.length) {
-        showMessage('Waiting for a line-up…');
-      } else {
-        hideMessage();
-        applyGridTemplate(wanted.length);
-        if (state.layout === 'focus' && wanted.length > 1) {
-          var main = tiles.get(wanted[0]);
-          if (main) main.el.style.gridArea = '1 / 1 / ' + wanted.length + ' / 2';
-        }
-      }
-
-      tiles.forEach(function (tile) {
-        applyMuted(tile);
-        applyQuality(tile);
-      });
-    }
-
-    function applyState(next) {
-      if (!next || typeof next !== 'object') return;
-      if (Array.isArray(next.channels)) {
-        state.channels = next.channels.map(normalize).filter(Boolean);
-      }
-      if (typeof next.layout === 'string') state.layout = next.layout;
-      if ('audio' in next) state.audio = normalize(next.audio);
-      if ('quality' in next) state.quality = next.quality || null;
-      if ('labels' in next) state.labels = !!next.labels;
-      render();
-    }
-
-    // -- inputs ---------------------------------------------------------------
-
-    function stateFromQuery() {
-      var params = new URLSearchParams(location.search);
-      var raw = params.get('c') || params.get('channels') || '';
-      return {
-        channels: raw.split(/[,+|\s]+/),
-        layout: params.get('layout') || 'auto',
-        audio: params.get('audio') || null,
-        quality: params.get('q') || null,
-        labels: params.get('labels') !== '0'
-      };
-    }
-
-    /**
-     * 2-UA Presentation API: the userscript calls PresentationRequest.start() with this
-     * page's URL, the receiver device loads it, and the two halves then talk over the
-     * connection so the line-up can change without a reload.
-     */
-    function wirePresentation() {
-      if (!navigator.presentation || !navigator.presentation.receiver) return;
-      navigator.presentation.receiver.connectionList.then(function (list) {
-        var attach = function (connection) {
-          connection.addEventListener('message', function (event) {
-            try {
-              applyState(JSON.parse(event.data));
-            } catch (err) {
-              /* ignore anything that is not our JSON */
-            }
-          });
-          try { connection.send(JSON.stringify({ type: 'ready', host: HOST })); } catch (ignored) { /* noop */ }
-        };
-        list.connections.forEach(attach);
-        list.addEventListener('connectionavailable', function (event) { attach(event.connection); });
-      }).catch(function () { /* not a presentation context after all */ });
-    }
-
-    // -- boot -----------------------------------------------------------------
-
-    msgUrl.textContent = location.origin + location.pathname + '?c=channel1,channel2';
-
-    if (!HOST) {
-      showMessage('Twitch embeds need a real hostname for their parent= parameter, so this page '
-        + 'has to be served over http(s) — opening the file directly will not play anything.', true);
-      return;
-    }
-
-    loadSdk().then(function (ctor) {
-      Player = ctor;
-      wirePresentation();
-      applyState(stateFromQuery());
-      if (!state.channels.length) {
-        showMessage('Waiting for a line-up… open this page with ?c=channel1,channel2, or cast to it '
-          + 'from the Twitch Multi-View userscript.');
-      }
-    });
-
-    // Keep the picture alive on TV browsers that reflow lazily after an HDMI wake-up.
-    window.addEventListener('resize', function () {
-      if (state.channels.length) applyGridTemplate(state.channels.length);
-    });
-  })();
-  </script>
+  <script src="https://player.twitch.tv/js/embed/v1.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
