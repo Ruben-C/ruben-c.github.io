@@ -19,9 +19,16 @@
 
   const SCOPES = 'user:read:follows';
   const DEVICE_URL = 'https://id.twitch.tv/oauth2/device';
+  const LOGIN_URL = 'https://www.twitch.tv/login';
   const TOKEN_URL = 'https://id.twitch.tv/oauth2/token';
   const HELIX = 'https://api.twitch.tv/helix/';
   const SDK_READY = !!(window.Twitch && window.Twitch.Player);
+
+  /* Android WebView puts "; wv" in its user agent. The playback sign-in is
+   * offered only there, because it is worthless anywhere else: it depends on
+   * the shell permitting third-party cookies, and a desktop browser blocks
+   * them with no equivalent switch. */
+  const IN_SHELL = /;\s*wv\b/.test(navigator.userAgent);
 
   /* Four is the practical ceiling: Android commonly allows about four
    * concurrent hardware video decoders and a fifth tile just goes black. */
@@ -103,7 +110,8 @@
     userId: null,
     followed: [],
     followedAt: 0,
-    warnedFallback: false
+    warnedFallback: false,
+    setupConfirm: null   // OK handler while the setup screen is up, if any
   };
 
   // --------------------------------------------------------------- storage
@@ -839,6 +847,15 @@
       ? { label: 'Sign out', run: () => { signOut(); closeMenu(); } }
       : { label: 'Sign in to load followed channels', run: () => { closeMenu(); startDeviceAuth(); } });
 
+    /* Nothing to do with the item above: that one signs in for *metadata*,
+     * this one for *playback*. See playbackSignIn(). */
+    if (IN_SHELL) {
+      items.push({
+        label: 'Twitch account for playback…',
+        run: () => { closeMenu(); playbackSignIn(); }
+      });
+    }
+
     state.menu = { items: items, sel: 0 };
     state.mode = 'menu';
     dom.menuTitle.textContent = tile ? tile.channel : 'Multi-View';
@@ -1006,6 +1023,7 @@
     }
 
     state.mode = 'setup';
+    state.setupConfirm = null;   // this screen has no OK action
     dom.setup.classList.remove('hidden');
     showSetup([
       el('h1', { text: 'Signing in…' }),
@@ -1153,6 +1171,39 @@
     renderSidebar();
   }
 
+  /* Playback sign-in — unrelated to the device-code flow above, and the two
+   * get confused constantly, so: that one authenticates *metadata* and fixes
+   * the followed list. This one is about the *player*.
+   *
+   * The players are third-party iframes with no Twitch session, which is why
+   * ads play, sub-only channels refuse and mature gates stop a tile. There is
+   * no embed API call that hands a session to a player — that part of CLAUDE.md
+   * is still true. The only route is the browser's cookie jar: load twitch.tv
+   * as a top-level page in this same WebView so Twitch sets its cookie
+   * first-party, and let the shell's setAcceptThirdPartyCookies carry it into
+   * the iframes.
+   *
+   * It is a one-off; WebView cookies persist and Twitch sessions are long.
+   * Signing out again means coming back here and using Twitch's own menu.
+   *
+   * Treat this as an experiment until it has been watched on the device. It
+   * turns on whether Twitch marks its auth cookie SameSite=None, which is not
+   * observable from this origin — a Lax cookie is never sent cross-site and
+   * nothing here can change that. Hence the deliberately unpromising wording
+   * on screen: it must not read as a feature that is known to work. */
+  function playbackSignIn() {
+    state.mode = 'setup';
+    state.setupConfirm = () => { location.href = LOGIN_URL; };
+    dom.setup.classList.remove('hidden');
+    showSetup([
+      el('h1', { text: 'Twitch account for playback' }),
+      el('p', { text: 'The streams play logged out, which is why they show ads and why sub-only channels will not start.' }),
+      el('p', { text: 'Signing in to Twitch itself here may fix that — Turbo and subscriptions would then apply. It may also change nothing; Twitch decides.' }),
+      el('p', { text: 'The grid closes and Twitch opens. Sign in, then press Back to return. Your streams come back as they were.' }),
+      el('p', { text: 'Press OK to go to Twitch, or Back to stay here.' })
+    ]);
+  }
+
   function showSetup(nodes) {
     dom.setupCard.textContent = '';
     for (const node of nodes) if (node) dom.setupCard.appendChild(node);
@@ -1160,6 +1211,7 @@
 
   function closeSetup() {
     dom.setup.classList.add('hidden');
+    state.setupConfirm = null;
     state.mode = 'grid';
     renderSelection();
     resumePlayback(true);
@@ -1250,7 +1302,13 @@
 
     if (BACK_KEYS.indexOf(key) >= 0) return window.tvBack();
 
-    if (state.mode === 'setup') return true; // swallow everything but Back
+    /* The setup screen swallows everything but Back, except that a screen may
+     * offer a single OK action — the device-code screen has none, the playback
+     * sign-in confirms with it. */
+    if (state.mode === 'setup') {
+      if (OK_KEYS.indexOf(key) >= 0 && state.setupConfirm) state.setupConfirm();
+      return true;
+    }
 
     if (state.mode === 'menu') return routeMenu(key);
     if (state.mode === 'sidebar') return routeSidebar(key);
