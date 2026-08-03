@@ -30,12 +30,32 @@
    * them with no equivalent switch. */
   const IN_SHELL = /;\s*wv\b/.test(navigator.userAgent);
 
-  /* Four is the practical ceiling: Android commonly allows about four
-   * concurrent hardware video decoders and a fifth tile just goes black. */
-  const MAX_TILES = 4;
+  /* Nine tiles is a geometry limit, not a hardware one: three rows is as many
+   * as fit above Twitch's autoplay size minimum at the declared viewport (see
+   * the meta comment in index.html), and three columns of 16:9 is what three
+   * rows implies.
+   *
+   * The hardware limit is separate and lower. Android commonly allows about
+   * four concurrent hardware video decoders, and past that MediaCodec fails to
+   * allocate and a tile goes BLACK rather than erroring visibly — there is
+   * nothing to catch. So SAFE_TILES is what is known to work and MAX_TILES is
+   * what the layout can express; crossing between them warns once and then
+   * lets the device answer for itself. Tune from `adb logcat | grep -i codec`
+   * on the actual box, never from what worked elsewhere. */
+  const SAFE_TILES = 4;
+  const MAX_TILES = 9;
 
-  const QUALITY_TARGETS = ['160p', '360p', '480p', '720p'];
-  const LAYOUTS = ['auto', '2x2', 'focus'];
+  /* Five tiles is where the label bar starts costing more video height than it
+   * is worth. Matches #stage.dense in index.html. */
+  const DENSE_FROM = 5;
+
+  const QUALITY_TARGETS = ['auto', '160p', '360p', '480p', '720p'];
+  const QUALITY_TIERS = ['160p', '360p', '480p', '720p'];   // ascending, no 'auto'
+  const LAYOUTS = ['auto', 'even', 'focus'];
+
+  /* Sessions saved before the nine-tile layouts, and hashes typed from memory. */
+  const LAYOUT_ALIASES = { '2x2': 'even', '2x1': 'even', grid: 'even', solo: 'auto' };
+
   const FOLLOWED_TTL = 90e3;
 
   /* A paused player is nudged back to life by the sweep in init(). Bounded so
@@ -51,10 +71,24 @@
    * A tile that has NEVER played may simply still be starting, and on a Shield
    * with three tiles that was measured taking upwards of 30 seconds from load.
    * Treating it as broken any earlier means tearing down a player that was
-   * about to work — which is worse than waiting. A minute is deliberately far
-   * past anything observed. */
+   * about to work — which is worse than waiting.
+   *
+   * That wait has to scale with the tile count, because the tiles contend: nine
+   * players negotiating autoplay, fetching manifests and claiming decoders all
+   * at once are all slower than three were. The constants are set so that three
+   * tiles still give the 60s that was actually measured, and nine give two
+   * minutes. Both are deliberately far past anything observed — a wait that is
+   * too long only delays the safety net, while one that is too short tears down
+   * players that were about to work. */
   const RESUME_GRACE = 8e3;
-  const START_GRACE = 60e3;
+  const START_GRACE_BASE = 30e3;
+  const START_GRACE_PER_TILE = 10e3;
+  const START_GRACE_MAX = 120e3;
+
+  function startGrace() {
+    return Math.min(START_GRACE_MAX,
+      START_GRACE_BASE + START_GRACE_PER_TILE * state.tiles.length);
+  }
 
   const LS_SESSION = 'tmvtv.session';
   const LS_AUTH = 'tmvtv.auth';
@@ -101,8 +135,8 @@
     audio: null,         // login of the audible channel, or null
     big: null,           // login of the main tile in focus layout
     layout: 'auto',
-    quality: '480p',     // main tile
-    railQuality: '360p', // every other tile
+    quality: 'auto',     // main tile
+    railQuality: 'auto', // every other tile
     mode: 'grid',        // grid | sidebar | menu | setup
     menu: { items: [], sel: 0 },
     side: { items: [], sel: 0 },
@@ -111,6 +145,8 @@
     followed: [],
     followedAt: 0,
     warnedFallback: false,
+    warnedDecoders: false,
+    warnedUndersized: {},   // geometry key -> already logged; see warnIfUndersized()
     setupConfirm: null   // OK handler while the setup screen is up, if any
   };
 
@@ -166,7 +202,7 @@
     if (!channels.length) return null;
     return {
       channels: channels,
-      layout: LAYOUTS.indexOf(params.get('layout')) >= 0 ? params.get('layout') : 'auto',
+      layout: normalizeLayout(params.get('layout')) || 'auto',
       audio: normalizeChannel(params.get('audio') || ''),
       big: normalizeChannel(params.get('big') || ''),
       quality: QUALITY_TARGETS.indexOf(params.get('q')) >= 0 ? params.get('q') : null,
@@ -192,6 +228,13 @@
 
   function normalizeChannel(value) {
     return String(value || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+  }
+
+  /* Returns null for anything unrecognised so the caller can fall back, rather
+   * than silently pinning a stored session to a layout that no longer exists. */
+  function normalizeLayout(value) {
+    const name = LAYOUT_ALIASES[value] || value;
+    return LAYOUTS.indexOf(name) >= 0 ? name : null;
   }
 
   // ------------------------------------------------------------------ toast
@@ -229,6 +272,7 @@
       this.mountedAt = Date.now();   // reset by mount(); see resume()
       this.qualities = [];
       this.appliedQuality = null;
+      this.videoH = 0;               // set by layoutStage(); drives 'auto' quality
       this.build();
       // mount() is deliberately NOT called here: the Embed SDK resolves the
       // container by id via getElementById, so the element has to be in the
@@ -251,11 +295,11 @@
 
       /* The bar is a real grid row BENEATH the video, not an overlay. Anything
        * painted over the player makes Twitch's autoplay check fail — see the
-       * tile comment in index.html. */
-      this.el = el('div', { class: 'tile' }, [
-        this.videoEl,
-        el('div', { class: 'tile-bar' }, [this.numEl, this.nameEl, this.badgesEl])
-      ]);
+       * tile comment in index.html. Kept as a field because layoutStage()
+       * measures its height: it is the one part of a tile that is not 16:9, so
+       * every rectangle in every layout is derived from it. */
+      this.barEl = el('div', { class: 'tile-bar' }, [this.numEl, this.nameEl, this.badgesEl]);
+      this.el = el('div', { class: 'tile' }, [this.videoEl, this.barEl]);
     }
 
     mount() {
@@ -337,7 +381,7 @@
       if (!this.player || !this.online) return false;
       const age = Date.now() - this.mountedAt;
       if (this.everPlayed) return age >= RESUME_GRACE && this.isPausedNow();
-      return age >= START_GRACE;
+      return age >= startGrace();
     }
 
     /* The embed never restarts itself once it has paused, so the app has to
@@ -461,7 +505,9 @@
      * step or two. With four tiles this is the difference between playing and
      * a black box, because the decoder ceiling is the real constraint. */
     targetQuality() {
-      return this.channel === state.big ? state.quality : state.railQuality;
+      const isBig = this.channel === state.big;
+      const set = isBig ? state.quality : state.railQuality;
+      return set === 'auto' ? autoQuality(this.videoH, state.tiles.length, isBig) : set;
     }
 
     applyQuality() {
@@ -539,6 +585,40 @@
     return best;
   }
 
+  /* 'auto' resolves two limits at once.
+   *
+   * The budget is by tile count, and it is the one that matters. It reproduces
+   * exactly what was measured on the Shield — 720p solo, 480p main and 360p
+   * rail at four up — and then holds flat, because the ceiling that actually
+   * bites past four tiles is the NUMBER of concurrent hardware decoders, which
+   * no choice of resolution changes. Dropping everything to 160p at nine tiles
+   * would look terrible and buy nothing against the failure it was meant to
+   * prevent.
+   *
+   * The pixel rule is the cheap half: never fetch more rows than the tile can
+   * show. It rarely binds under the budget, but it keeps the whole thing honest
+   * if a denser layout is added later.
+   *
+   * "Smallest tier at or above the tile" rather than "nearest tier", and the
+   * difference is not cosmetic: nearest hands a 203px tile 160p, which is an
+   * upscale — deliberately fetching fewer rows than the tile is about to draw.
+   * The point of this half is to stop paying for pixels that get thrown away,
+   * not to blur the picture, so it may only ever round up. */
+  function autoBudget(count, isBig) {
+    if (count <= 2) return isBig ? '720p' : '480p';
+    return isBig ? '480p' : '360p';
+  }
+
+  function autoQuality(videoH, count, isBig) {
+    const cap = autoBudget(count, isBig);
+    if (!videoH) return cap;          // before the first layout pass
+    let pick = QUALITY_TIERS[QUALITY_TIERS.length - 1];
+    for (const tier of QUALITY_TIERS) {
+      if (parseInt(tier, 10) >= videoH) { pick = tier; break; }   // ascending
+    }
+    return QUALITY_TIERS.indexOf(pick) < QUALITY_TIERS.indexOf(cap) ? pick : cap;
+  }
+
   /* Belt and braces with the focusin guard: an embed iframe that can be
    * focused is an embed iframe that can eat the remote. */
   function hardenFrames() {
@@ -565,6 +645,15 @@
     if (side) snapClosedPanels();
     dom.app.classList.toggle('shift-left', side === 'left');
     dom.app.classList.toggle('shift-right', side === 'right');
+    /* Synchronously, in the same turn as the padding change. Tiles are placed
+     * in px, so narrowing the stage does not move them — they would keep their
+     * old rectangles and hang out under the panel, which is the occlusion that
+     * pauses every stream. The ResizeObserver would also catch this, but only
+     * on the next frame and only while frames are being produced; a paused or
+     * throttled renderer delivers no callbacks at all. The known state changes
+     * therefore ask directly, and the observer stays as the backstop for the
+     * ones nothing thought to announce. */
+    layoutStage();
   }
 
   /* Widening the stage the instant a panel starts sliding away puts tiles back
@@ -575,6 +664,7 @@
     clearTimeout(shiftTimer);
     shiftTimer = setTimeout(() => {
       dom.app.classList.remove('shift-left', 'shift-right');
+      layoutStage();       // widen the tiles back out; see setShift()
       resumePlayback(true);
     }, 240);
   }
@@ -608,6 +698,261 @@
     return state.tiles.some((tile) => tile.isStuck());
   }
 
+  // ----------------------------------------------------------------- layout
+
+  /* Streams are 16:9. Everything here follows from that and from one number.
+   *
+   * Twitch refuses autoplay below roughly 400x300 CSS px of player, and says so
+   * in the console as "minimum requirements for autoplay were not met: size".
+   * That is a floor on the SMALLEST tile in any layout, and at nine tiles it is
+   * the constraint that decides the whole design: with the stage box at the
+   * declared 2880 viewport, three rows leave 365px of video per tile and four
+   * rows leave 245 — so three rows is the ceiling, and three rows of 16:9 is
+   * what makes nine the tile limit. See the meta viewport comment in
+   * index.html for where those numbers come from.
+   *
+   * Every plan below therefore sizes each tile to the largest 16:9 video its
+   * cell can hold, rather than stretching it to fill the cell and letting the
+   * player letterbox itself inside. That is worth real screen: the stage box is
+   * close to 2:1 and a 3x3 of 16:9 is 16:9, so a stretched 3x3 spends about a
+   * quarter of its area on black bars that the tile could have used. */
+  const VIDEO_AR = 16 / 9;
+  const MIN_PLAYER_W = 400;
+  const MIN_PLAYER_H = 300;
+
+  /* Focus layouts: one big tile plus the rest, expressed as a uniform cell grid
+   * with the big tile spanning a block of cells at the top left. The free cells
+   * are then filled in reading order — the strip beside the big tile, then the
+   * band underneath it.
+   *
+   * Each row is chosen so the free cells come out equal to the number of small
+   * tiles, or one over. Both other outcomes are bad: too few and a tile has
+   * nowhere to go, too many and the grid has visible holes in it. The columns
+   * are also bounded by the size minimum — five columns puts the small tiles at
+   * 508x286 and under the floor, which is why nothing here is wider than four.
+   *
+   * n=5 and n=8 carry the one spare cell, and it lands in the bottom band where
+   * a short row gets centred, so it reads as space rather than as a gap. */
+  const FOCUS_PLANS = {
+    /* Two rows even for two tiles, which looks like one row too many until you
+     * work it out: cells are the size of a tile, so a big tile spanning one row
+     * is exactly one row tall, and being 16:9 it is then exactly as wide as a
+     * small one. A one-row focus layout cannot have a big tile at all. */
+    2: { cols: 3, rows: 2, sc: 2, sr: 2 },
+    3: { cols: 3, rows: 2, sc: 2, sr: 2 },
+    4: { cols: 4, rows: 3, sc: 3, sr: 3 },
+    5: { cols: 3, rows: 3, sc: 2, sr: 2 },
+    6: { cols: 3, rows: 3, sc: 2, sr: 2 },
+    7: { cols: 4, rows: 3, sc: 3, sr: 2 },
+    8: { cols: 4, rows: 3, sc: 2, sr: 2 },
+    9: { cols: 4, rows: 3, sc: 2, sr: 2 }
+  };
+
+  function remPx() {
+    return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  }
+
+  /* What a cell would be if the stage were divided evenly. Only used to work
+   * out how big a 16:9 tile can be; nothing is placed on it. */
+  function cellGrid(box, gap, cols, rows) {
+    return {
+      cellW: (box.w - (cols - 1) * gap) / cols,
+      cellH: (box.h - (rows - 1) * gap) / rows
+    };
+  }
+
+  /* Where tiles actually go: a block of uniform cells the size of the fitted
+   * tile, centred in the stage.
+   *
+   * This is the difference between a video wall and a scatter. A 3x3 of 16:9 is
+   * itself 16:9, but the stage box is nearer 2:1, so ~660px of width has
+   * nowhere to go. Centring each tile in an evenly divided cell spreads that
+   * slack into the gutters — 220px of dead space between every column, rows
+   * still tight, and the grid reads as broken rather than as deliberate.
+   * Sizing the cells to the tiles instead puts all of it in the outer margins,
+   * where it reads as a centred wall. It also keeps the columns of a focus
+   * layout aligned with the band underneath it, which per-cell centring does
+   * not.
+   *
+   * Fractional columns are deliberate: a half-cell offset is how a short row
+   * gets centred without disturbing the rhythm of the full ones. */
+  function compactGrid(box, gap, tileW, tileH, cols, rows) {
+    const x0 = (box.w - (cols * tileW + (cols - 1) * gap)) / 2;
+    const y0 = (box.h - (rows * tileH + (rows - 1) * gap)) / 2;
+    return {
+      x: (c) => x0 + c * (tileW + gap),
+      y: (r) => y0 + r * (tileH + gap)
+    };
+  }
+
+  /* The largest 16:9 video that fits a block, plus the label bar underneath it,
+   * centred in the block. The bar is the only part of a tile that is not 16:9,
+   * so it is subtracted before the aspect fit and added back after. */
+  function fitTile(x, y, w, h, bar) {
+    const videoH = Math.min(h - bar, w / VIDEO_AR);
+    const videoW = videoH * VIDEO_AR;
+    return {
+      x: x + (w - videoW) / 2,
+      y: y + (h - (videoH + bar)) / 2,
+      w: videoW,
+      h: videoH + bar,
+      videoW: videoW,
+      videoH: videoH
+    };
+  }
+
+  /* Equal tiles. Every (cols, rows) that can hold n is tried and the one giving
+   * the biggest video wins, so this needs no per-count table and stays right for
+   * a stage of any shape — which matters, because opening a side panel changes
+   * that shape. Ties go to the fewest columns, which is the one with the fewest
+   * empty cells. */
+  function planEven(n, box, gap, bar) {
+    let best = null;
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const cell = cellGrid(box, gap, cols, rows);
+      if (cell.cellW <= 0 || cell.cellH - bar <= 0) continue;
+      const tile = fitTile(0, 0, cell.cellW, cell.cellH, bar);
+      const score = tile.videoW * tile.videoH;
+      if (!best || score > best.score) best = { cols: cols, rows: rows, tile: tile, score: score };
+    }
+    if (!best) return null;
+
+    const grid = compactGrid(box, gap, best.tile.w, best.tile.h, best.cols, best.rows);
+    const rects = [];
+    for (let i = 0; i < n; i++) {
+      const row = Math.floor(i / best.cols);
+      const inRow = Math.min(best.cols, n - row * best.cols);
+      const col = (i - row * best.cols) + (best.cols - inRow) / 2;   // centre a short last row
+      rects.push(fitTile(grid.x(col), grid.y(row), best.tile.w, best.tile.h, bar));
+    }
+    return rects;
+  }
+
+  /* One big tile plus the rest. Returns rects indexed to match state.tiles, so
+   * the big tile keeps its own index and nothing has to be reordered — tiles are
+   * never re-parented, and their DOM order is not their visual order. */
+  function planFocus(n, box, gap, bar, bigIndex) {
+    const plan = FOCUS_PLANS[n];
+    if (!plan) return null;
+    const cell = cellGrid(box, gap, plan.cols, plan.rows);
+    if (cell.cellW <= 0 || cell.cellH - bar <= 0) return null;
+    const small = fitTile(0, 0, cell.cellW, cell.cellH, bar);
+    const grid = compactGrid(box, gap, small.w, small.h, plan.cols, plan.rows);
+
+    /* The strip beside the big tile first, then the band underneath it. A short
+     * strip is centred vertically and a short band row horizontally, so the one
+     * spare cell that some counts carry reads as space rather than as a hole. */
+    const cells = [];
+    const stripCols = plan.cols - plan.sc;
+    const stripUse = Math.min(n - 1, stripCols * plan.sr);
+    const stripRows = stripCols ? Math.ceil(stripUse / stripCols) : 0;
+    const stripTop = (plan.sr - stripRows) / 2;
+    for (let r = 0; r < stripRows; r++) {
+      for (let c = plan.sc; c < plan.cols && cells.length < stripUse; c++) {
+        cells.push({ c: c, r: r + stripTop });
+      }
+    }
+    for (let r = plan.sr; r < plan.rows; r++) {
+      const left = (n - 1) - cells.length;
+      if (left <= 0) break;
+      const inRow = Math.min(plan.cols, left);
+      const offset = (plan.cols - inRow) / 2;    // centre the short row, if any
+      for (let i = 0; i < inRow; i++) cells.push({ c: offset + i, r: r });
+    }
+    if (cells.length < n - 1) return null;
+
+    const rects = [];
+    rects[bigIndex] = fitTile(
+      grid.x(0), grid.y(0),
+      plan.sc * small.w + (plan.sc - 1) * gap,
+      plan.sr * small.h + (plan.sr - 1) * gap,
+      bar);
+
+    let next = 0;
+    for (let i = 0; i < n; i++) {
+      if (i === bigIndex) continue;
+      const at = cells[next++];
+      rects[i] = fitTile(grid.x(at.c), grid.y(at.r), small.w, small.h, bar);
+    }
+    return rects;
+  }
+
+  function meetsMinimum(rects) {
+    return rects.every((r) => r.videoW >= MIN_PLAYER_W && r.videoH >= MIN_PLAYER_H);
+  }
+
+  function planFor(n, box, gap, bar) {
+    const even = planEven(n, box, gap, bar);
+    if (n < 2) return even;
+
+    // 'auto' keeps tiles equal except at three, where a big-plus-two reads far
+    // better than two-over-one-centred. This is the layout the app shipped with.
+    const wantFocus = state.layout === 'focus' || (state.layout === 'auto' && n === 3);
+    if (!wantFocus || !even) return even;
+
+    const bigIndex = Math.max(0, state.tiles.findIndex((t) => t.channel === state.big));
+    const focus = planFocus(n, box, gap, bar, bigIndex);
+    if (!focus) return even;
+
+    /* Never let the chosen layout starve a tile below the autoplay minimum when
+     * the other layout would not. This is not theoretical: opening a side panel
+     * takes about a third of the stage width, and the four-column focus plans
+     * drop to 401x226 while an even 3x3 holds 546x307. The cost of getting it
+     * wrong is a tile that silently never starts, which is not diagnosable from
+     * a sofa. */
+    if (meetsMinimum(focus) || !meetsMinimum(even)) return focus;
+    return even;
+  }
+
+  /* Sized below what Twitch will autoplay. Nothing can be done about it from
+   * here — it means the stage is too small for this many tiles — but it is the
+   * single most likely cause of "some tiles are black", and the shell forwards
+   * console output to logcat, so say so there rather than leaving it to be
+   * bisected again.
+   *
+   * A set of seen geometries rather than just the last one: opening and closing
+   * a side panel alternates between two of them, so remembering one key means
+   * re-logging on every single toggle. The set is bounded by tile count times
+   * the handful of stage widths that exist. */
+  function warnIfUndersized(rects) {
+    const worst = rects.reduce((a, b) => (b.videoW * b.videoH < a.videoW * a.videoH ? b : a));
+    if (worst.videoW >= MIN_PLAYER_W && worst.videoH >= MIN_PLAYER_H) return;
+    const key = rects.length + ':' + Math.round(worst.videoW) + 'x' + Math.round(worst.videoH);
+    if (state.warnedUndersized[key]) return;
+    state.warnedUndersized[key] = true;
+    console.warn('[tmvtv] smallest player is ' + key.split(':')[1] + ' CSS px, under Twitch\'s '
+      + MIN_PLAYER_W + 'x' + MIN_PLAYER_H + ' autoplay minimum — expect size rejections');
+  }
+
+  /* Positions every tile. Called from render() and from the ResizeObserver, so
+   * it also covers a side panel shrinking the stage and a change of screen. */
+  function layoutStage() {
+    const n = state.tiles.length;
+    if (!n) return;
+    const box = { w: dom.stage.clientWidth, h: dom.stage.clientHeight };
+    if (box.w <= 0 || box.h <= 0) return;
+
+    /* The bar is measured rather than assumed, because .dense changes it and
+     * every rectangle is derived from it. render() applies .dense before
+     * calling here; reading the rect forces the style to be committed first. */
+    const bar = state.tiles[0].barEl.getBoundingClientRect().height;
+    const rects = planFor(n, box, remPx(), bar);
+    if (!rects) return;
+
+    state.tiles.forEach((tile, i) => {
+      const rect = rects[i];
+      if (!rect) return;
+      tile.el.style.left = rect.x + 'px';
+      tile.el.style.top = rect.y + 'px';
+      tile.el.style.width = rect.w + 'px';
+      tile.el.style.height = rect.h + 'px';
+      tile.videoH = rect.videoH;
+      tile.applyQuality();     // 'auto' follows the tile size; a no-op if unchanged
+    });
+    warnIfUndersized(rects);
+  }
+
   // ------------------------------------------------------------------- grid
 
   function addChannel(channel) {
@@ -615,8 +960,15 @@
     if (!channel) return;
     if (state.tiles.some((t) => t.channel === channel)) return;
     if (state.tiles.length >= MAX_TILES) {
-      toast('Four streams is the limit — remove one first.', 'warn');
+      toast(MAX_TILES + ' streams is the limit — remove one first.', 'warn');
       return;
+    }
+    /* Said once, and worth saying: past this point a tile that goes black is
+     * almost certainly MediaCodec failing to allocate a decoder, which produces
+     * no error anywhere the app can see. Warning is all that can be done. */
+    if (state.tiles.length >= SAFE_TILES && !state.warnedDecoders) {
+      state.warnedDecoders = true;
+      toast('More than ' + SAFE_TILES + ' streams — if a tile stays black, this box has run out of video decoders.', 'warn');
     }
     const tile = new Tile(channel);
     state.tiles.push(tile);
@@ -672,17 +1024,6 @@
     renderSelection();
   }
 
-  function layoutClass() {
-    const count = state.tiles.length;
-    if (count <= 1) return 'lay-solo';
-    if (state.layout === '2x2') return 'lay-2x2';
-    if (state.layout === 'focus') return 'lay-focus';
-    // auto
-    if (count === 2) return 'lay-2x1';
-    if (count === 3) return 'lay-focus';
-    return 'lay-2x2';
-  }
-
   function cycleLayout(step) {
     const index = LAYOUTS.indexOf(state.layout);
     state.layout = LAYOUTS[(index + step + LAYOUTS.length) % LAYOUTS.length];
@@ -694,27 +1035,26 @@
   function render() {
     const count = state.tiles.length;
     dom.empty.classList.toggle('hidden', count > 0);
-    dom.stage.classList.toggle('hidden', count === 0);
     if (!count) {
       dom.emptyMsg.innerHTML = CLIENT_ID
         ? 'Press <b>OK</b> to open your channel list.'
         : 'Set <b>CLIENT_ID</b> in <b>app.js</b> to load your followed channels, or open this page with <b>#c=channel1,channel2</b>.';
     }
 
-    const cls = layoutClass();
-    dom.stage.className = cls + ' n-' + count;
+    /* Set as one string so nothing can leave a stale layout class behind, and
+     * before layoutStage(), which measures a bar whose height .dense changes. */
+    dom.stage.className = (count ? '' : 'hidden ') + (count >= DENSE_FROM ? 'dense ' : '') + 'n-' + count;
 
-    /* Never re-append a tile. Moving an element that contains an iframe
-     * reloads that iframe, so reordering the DOM here would restart every
-     * player on each layout change. The main tile is placed explicitly by CSS
-     * and the rest auto-flow around it, which needs no DOM order at all. */
+    /* Never re-append a tile. Moving an element that contains an iframe reloads
+     * that iframe, so reordering the DOM here would restart every player on
+     * each layout change. layoutStage() positions tiles by index instead, which
+     * needs no DOM order at all. */
     state.tiles.forEach((tile, index) => {
-      tile.el.classList.toggle('tile--big', cls === 'lay-focus' && tile.channel === state.big);
       tile.numEl.textContent = String(index + 1);
-      tile.applyQuality();
       tile.renderBadges();
     });
 
+    layoutStage();
     renderSelection();
     hardenFrames();
   }
@@ -1409,7 +1749,7 @@
     const session = readHash() || load(LS_SESSION, null);
     if (!session || !session.channels || !session.channels.length) return;
 
-    if (session.layout && LAYOUTS.indexOf(session.layout) >= 0) state.layout = session.layout;
+    state.layout = normalizeLayout(session.layout) || state.layout;
     if (session.quality) state.quality = session.quality;
     if (session.railQuality) state.railQuality = session.railQuality;
     state.big = session.big || session.channels[0];
@@ -1450,9 +1790,24 @@
       resumePlayback(false);
     }, 1000);
 
+    /* The layout is px geometry, so it has to be recomputed whenever the stage
+     * changes shape — which happens without any state change at all: opening a
+     * side panel pads the stage in by a third of its width. Watching the element
+     * catches that, a screen change and the desktop dev loop alike. Setting tile
+     * styles does not resize the stage, so this cannot feed back on itself. */
+    if (window.ResizeObserver) {
+      new ResizeObserver(() => layoutStage()).observe(dom.stage);
+    } else {
+      window.addEventListener('resize', layoutStage);
+    }
+
     // Coming back from the launcher pauses everything; do not wait a second.
+    // Re-place the tiles too: nothing observes the stage while the renderer is
+    // throttled, so any reshape that happened meanwhile arrives unannounced.
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) resumePlayback(true);
+      if (document.hidden) return;
+      layoutStage();
+      resumePlayback(true);
     });
   }
 

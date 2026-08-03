@@ -6,12 +6,30 @@
        CSS viewport (4K panel, 960dp), which makes a tile in a 2x2 measure
        441x191 CSS px — under Twitch's 400x300 embed minimum, so EVERY tile is
        refused autoplay with "minimum requirements for autoplay were not met:
-       size". Declaring 1920 doubles every CSS measurement while the WebView
-       scales the page back down to fit, so the picture is physically identical
-       (all sizing here is vh/vw) and the tiles measure 881x382. Verified on the
-       Shield: 20 size rejections before, 0 after, three streams playing.
+       size". Declaring a wider viewport multiplies every CSS measurement while
+       the WebView scales the page back down to fit, so the picture is
+       physically identical — all sizing here is vh/vw, and vh/vw are invariant
+       under this declaration because it does not change the aspect ratio. Only
+       the px count Twitch measures changes. Verified on the Shield at 1920:
+       20 size rejections before, 0 after.
+
+       1920 was enough for two rows. It is NOT enough for three: at 1920 a tile
+       in a 3x3 measures 433x243 and every one of the nine is refused. The
+       binding term is height, and it works out as
+
+         video height = 0.2652H - bar        (three rows inside the stage box)
+
+       so 300px of video needs H >= ~1425, i.e. a declared width of ~2530. 2880
+       is the next round number clear of it: 3x3 tiles measure 649x365, and a
+       3x3 still measures 546x307 with a side panel open and the stage shrunk.
+
+       2880 is also close to the practical ceiling. The page scale on a 960px
+       device is 960/2880 = 0.333, and Chromium clamps page scale at 0.25 by
+       default — 3840 would land exactly on that clamp and crop the page.
+       minimum-scale is stated anyway so a device reporting a narrower CSS
+       width cannot hit the clamp either.
        Needs useWideViewPort=true in the shell, which is already set. -->
-  <meta name="viewport" content="width=1920, viewport-fit=cover">
+  <meta name="viewport" content="width=2880, minimum-scale=0.1, viewport-fit=cover">
   <title>Twitch Multi-View for TV</title>
   <style>
     /* ---------------------------------------------------------------- base */
@@ -63,24 +81,21 @@
 
     .hidden { display: none !important; }
 
-    /* --------------------------------------------------------------- stage */
-    #stage {
-      flex: 1; min-height: 0;
-      display: grid; gap: 1rem;
-    }
-    #stage.lay-solo  { grid-template-columns: 1fr; grid-template-rows: 1fr; }
-    #stage.lay-2x1   { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
-    #stage.lay-2x2   { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
-    /* Three tiles in a 2x2 would leave a hole; let the last one fill the row. */
-    #stage.lay-2x2.n-3 .tile:last-child { grid-column: span 2; }
+    /* --------------------------------------------------------------- stage
+       No grid tracks. Tiles are positioned absolutely from layoutStage().
 
-    /* Focus layouts: one large tile plus a rail down the right. The rail row
-       count follows the tile count so the rail always fills its column. */
-    #stage.lay-focus { grid-template-columns: 3fr 1fr; }
-    #stage.lay-focus.n-2 { grid-template-rows: 1fr; }
-    #stage.lay-focus.n-3 { grid-template-rows: 1fr 1fr; }
-    #stage.lay-focus.n-4 { grid-template-rows: 1fr 1fr 1fr; }
-    #stage.lay-focus .tile--big { grid-column: 1; grid-row: 1 / -1; }
+       Streams are 16:9 and a 1fr cell is not, so a tile stretched to fill its
+       cell shows the player letterboxed inside itself. At four tiles that is
+       merely wasteful; at nine, with the stage box near 2:1 and the grid 16:9,
+       it is a quarter of the screen spent on black bars. So every tile is sized
+       to the largest 16:9 video its cell can hold and centred in that cell,
+       which is px geometry that CSS tracks cannot express — the cell aspect
+       ratio changes with the tile count, the layout and whether a panel is
+       open.
+
+       Moving a tile this way is a resize, never a re-parent, so no iframe is
+       reloaded — the rule in the tile comment below still holds. */
+    #stage { flex: 1; min-height: 0; position: relative; }
 
     /* ---------------------------------------------------------------- tile
        The styling here is constrained by Twitch's autoplay check, which reads
@@ -94,7 +109,7 @@
        and the label bar is a real grid row BELOW the video rather than an
        overlay. Do not "tidy" this back into an overlay. */
     .tile {
-      position: relative; min-width: 0; min-height: 0;
+      position: absolute; min-width: 0; min-height: 0;
       display: grid; grid-template-rows: 1fr auto;
       background: #000;
       box-shadow: 0 0 0 0.2rem #26262c;
@@ -143,6 +158,16 @@
       font-size: .95rem; font-weight: 800; flex-shrink: 0;
     }
     .tile--sel .tile-num { background: #a970ff; color: #1a0033; }
+
+    /* Five tiles or more. The label bar is a fixed number of rem, so as tiles
+       get smaller it takes a bigger share of each one — and every rem it takes
+       is a rem off the video, which is height off Twitch's 300px autoplay
+       minimum. Shrink the bar rather than the picture. Applied by render()
+       BEFORE layoutStage() measures the bar, because the measurement is what
+       the whole layout is computed from. */
+    #stage.dense .tile-bar { padding: .3rem .5rem; font-size: .8rem; gap: .45rem; }
+    #stage.dense .tile-num { min-width: 1.3rem; height: 1.3rem; font-size: .8rem; }
+    #stage.dense .badge    { padding: .1rem .45rem; font-size: .65rem; }
 
     /* Only ever shown when the stream is offline, so there is no autoplay to
        block by covering the player. */
