@@ -6,8 +6,8 @@
 // next open, and built assets are cache-first because their names carry a
 // content hash. Live wait data is never cached here: the API lives on another
 // origin and the app keeps its own timestamped copy in localStorage.
-const CACHE = 'park-day-2ea8c339b0';
-const PRECACHE = ["./","./index.html","./manifest.webmanifest","./icon.svg","./assets/index-0wVF7yJb.css","./assets/index-DRTwAod2.js"];
+const CACHE = 'park-day-__VERSION__';
+const PRECACHE = __PRECACHE__;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

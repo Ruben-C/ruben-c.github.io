@@ -1,0 +1,221 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Palette. Every colour is a variable so the whole app flips in dark mode;
+   tailwind.config.js exposes the same names as utilities (bg-card, text-ink, ...). */
+:root {
+  --paper: #f3f1f8;
+  --card: #ffffff;
+  --sunk: #ebe8f3;
+  --ink: #1d1a36;
+  --muted: #625e7f;
+  --line: #dedaea;
+  --accent: #4a3fb0;
+  --accent-ink: #ffffff;
+  --accent-soft: #e8e5fa;
+  --gold: #8f6514;
+  --gold-soft: #f6ecd4;
+  --band: #241f4f;
+  --band-ink: #f4f0ff;
+  --band-muted: #bdb6e6;
+  --band-gold: #e9c46a;
+  --go: #137a4f;
+  --go-soft: #dcf2e7;
+  --soon: #9a5a00;
+  --soon-soft: #fbead0;
+  --flex: #285f9e;
+  --flex-soft: #e0ebf8;
+  --later: #5b6278;
+  --later-soft: #e7e9ef;
+  --skip: #a3283f;
+  --skip-soft: #f8dfe4;
+  --hallow: #8a3ea8;
+  --hallow-soft: #f1e2f7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --paper: #12111d;
+    --card: #1b1a2b;
+    --sunk: #232236;
+    --ink: #eeebf8;
+    --muted: #a6a1c2;
+    --line: #302e48;
+    --accent: #a497ff;
+    --accent-ink: #15122e;
+    --accent-soft: #2b2752;
+    --gold: #e2b85c;
+    --gold-soft: #3a2f17;
+    --band: #1a1640;
+    --band-ink: #f4f0ff;
+    --band-muted: #aaa3d6;
+    --band-gold: #e9c46a;
+    --go: #5ad39b;
+    --go-soft: #173528;
+    --soon: #f0b257;
+    --soon-soft: #3b2a12;
+    --flex: #8bb8ee;
+    --flex-soft: #1b2a3e;
+    --later: #a9b0c6;
+    --later-soft: #262a36;
+    --skip: #f08a9c;
+    --skip-soft: #3d1c24;
+    --hallow: #d49af0;
+    --hallow-soft: #33203f;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --paper: #12111d;
+  --card: #1b1a2b;
+  --sunk: #232236;
+  --ink: #eeebf8;
+  --muted: #a6a1c2;
+  --line: #302e48;
+  --accent: #a497ff;
+  --accent-ink: #15122e;
+  --accent-soft: #2b2752;
+  --gold: #e2b85c;
+  --gold-soft: #3a2f17;
+  --band: #1a1640;
+  --band-ink: #f4f0ff;
+  --band-muted: #aaa3d6;
+  --band-gold: #e9c46a;
+  --go: #5ad39b;
+  --go-soft: #173528;
+  --soon: #f0b257;
+  --soon-soft: #3b2a12;
+  --flex: #8bb8ee;
+  --flex-soft: #1b2a3e;
+  --later: #a9b0c6;
+  --later-soft: #262a36;
+  --skip: #f08a9c;
+  --skip-soft: #3d1c24;
+  --hallow: #d49af0;
+  --hallow-soft: #33203f;
+  color-scheme: dark;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family:
+    Figtree,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 font-semibold transition active:scale-[.98] disabled:opacity-50;
+    min-height: 46px;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  .btn-ghost {
+    @apply border border-line bg-card text-ink;
+  }
+  .btn-gold {
+    background: var(--gold-soft);
+    color: var(--gold);
+    border: 1px solid color-mix(in srgb, var(--gold) 35%, transparent);
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-bold uppercase tracking-wider;
+  }
+  .field {
+    @apply w-full rounded-lg border border-line bg-card px-3 text-ink;
+    min-height: 44px;
+    font-size: 16px; /* 16px stops iOS zooming into the field */
+  }
+  .panel {
+    @apply rounded-2xl border border-line bg-card;
+  }
+  .seg {
+    @apply flex rounded-xl bg-sunk p-1;
+  }
+  .seg > button {
+    @apply flex-1 rounded-lg px-2 text-sm font-semibold text-muted;
+    min-height: 40px;
+  }
+  .seg > button[aria-pressed='true'] {
+    @apply bg-card text-ink shadow-sm;
+  }
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.band {
+  background: var(--band);
+  color: var(--band-ink);
+}
+.band-muted {
+  color: var(--band-muted);
+}
+.band-gold {
+  color: var(--band-gold);
+}
+
+.eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.pulse {
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
